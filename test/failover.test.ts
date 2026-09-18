@@ -192,6 +192,8 @@ test("model identity folds Cursor effort suffixes and the cursor- prefix", () =>
 test("cross-provider quality bands quarantine Astra/Fable above ordinary frontier", () => {
 	assert.equal(modelQualityBand("gpt-6-astra", "openai-codex-account-2"), "apex");
 	assert.equal(modelQualityBand("claude-fable-5-1", "anthropic-account-2"), "apex");
+	assert.equal(modelQualityBand("fable", "pi-claude-code-provider"), "apex");
+	assert.equal(modelQualityBand("fable", "unrelated-provider"), undefined);
 	assert.equal(modelQualityBand("anthropic/claude-fable-5.1", "openrouter"), "apex");
 	assert.equal(
 		modelQualityBand("claude-fable-5-1-high", "cursor"),
@@ -336,6 +338,8 @@ function setup(opts: {
 	hostCodexModels?: string[];
 	/** Optional exact host catalog by provider, used for cross-family/apex routing tests. */
 	hostModelsByProvider?: Record<string, string[]>;
+	/** Providers whose auth is supplied by an extension rather than auth.json. */
+	ambientAuthProviders?: string[];
 	/** Accounts Pi does NOT know any model for — logged in, but unusable until configured. */
 	unknownProviders?: string[];
 	/** The level the SESSION runs at (what `--thinking` / `/thinking` produced). */
@@ -547,7 +551,7 @@ function setup(opts: {
 							},
 							hasAuth: (provider: string) => {
 								const entry = JSON.parse(readFileSync(AUTH, "utf8"))[provider];
-								return !!(entry?.key || entry?.access);
+								return opts.ambientAuthProviders?.includes(provider) || !!(entry?.key || entry?.access);
 							},
 						}
 					: {
@@ -566,7 +570,7 @@ function setup(opts: {
 								},
 								hasAuth: (provider: string) => {
 								const entry = JSON.parse(readFileSync(AUTH, "utf8"))[provider];
-								return !!(entry?.key || entry?.access);
+								return opts.ambientAuthProviders?.includes(provider) || !!(entry?.key || entry?.access);
 							},
 						},
 			getProviderAuthStatus: (provider: string) => ({
@@ -6902,6 +6906,56 @@ test("ordinary Opus/Sol failover cannot promote itself into Astra or Fable", asy
 	await finishError(t, "anthropic", "claude-opus-5", "429 rate_limit_error");
 	assert.equal(t.rec.setModels.at(-1), "openai-codex-account-2/gpt-5.6-sol");
 	assert.ok(!t.rec.setModels.some((model) => /astra|fable/i.test(model)));
+	await t.fire("session_shutdown");
+});
+
+for (const [alias, nativeId] of [
+	["fable", "claude-fable-5-1"],
+	["opus", "claude-opus-5"],
+	["sonnet", "claude-sonnet-5"],
+	["haiku", "claude-haiku-4-5"],
+]) {
+	test(`Claude Code ${alias} quota falls back to the same Anthropic tier before Codex`, async () => {
+		const t = setup({
+			accounts: {
+				"openai-codex": { type: "oauth", access: "c", refresh: "cr", accountId: "codex" },
+				"anthropic-account-2": { type: "oauth", access: "a", refresh: "ar" },
+			},
+			current: { provider: "pi-claude-code-provider", id: alias },
+			ambientAuthProviders: ["pi-claude-code-provider"],
+			thinkingLevel: "low",
+			config: {
+				providerOrder: ["openai-codex"],
+				providerPriority: ["openai-codex", "anthropic"],
+				includeOtherProviders: false,
+				preferLatestModel: false,
+				neverFailoverProviders: ["openrouter", "cerebras"],
+			},
+			hostCodexModels: ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+			hostModelsByProvider: {
+				anthropic: ["claude-haiku-4-5", "claude-opus-5", "claude-sonnet-5", "claude-fable-5-1"],
+			},
+		});
+		await t.fire("session_start");
+		await finishError(t, "pi-claude-code-provider", alias,
+			"Claude Code request failed (429): You've hit your session limit · resets 5pm (America/Los_Angeles)");
+		assert.equal(t.rec.setModels.at(-1), `anthropic-account-2/${nativeId}`);
+		assert.equal(t.thinkingLevel(), "low");
+		assert.ok(t.rec.continueCalls.length + t.rec.sent.length > 0, `the interrupted turn must continue automatically: ${t.rec.notifies.join("; ")}`);
+		await t.fire("session_shutdown");
+	});
+}
+
+test("Claude Code Fable cannot downgrade when no apex subscription fallback exists", async () => {
+	const t = setup({
+		accounts: { "anthropic-account-2": { type: "oauth", access: "a", refresh: "ar" } },
+		current: { provider: "pi-claude-code-provider", id: "fable" },
+		ambientAuthProviders: ["pi-claude-code-provider"],
+		hostModelsByProvider: { anthropic: ["claude-haiku-4-5", "claude-opus-5"] },
+	});
+	await t.fire("session_start");
+	await finishError(t, "pi-claude-code-provider", "fable", "429 rate_limit_error");
+	assert.deepEqual(t.rec.setModels, []);
 	await t.fire("session_shutdown");
 });
 

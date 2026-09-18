@@ -2709,6 +2709,9 @@ export function modelQualityBand(modelId: string | undefined, provider?: string)
 	if (!modelId) return undefined;
 	const exceptional = apexIdentity(modelId);
 	const baseProvider = baseProviderId(provider);
+	// Claude Code publishes product aliases, not native Anthropic model ids.
+	// Scope Fable to that provider: an unrelated model named "fable" is not an apex peer.
+	if (baseProvider === "pi-claude-code-provider" && modelId === "fable") return "apex";
 	if (exceptional) {
 		if (baseProvider === "cursor") return undefined;
 		if (!provider) return "apex";
@@ -2737,6 +2740,8 @@ export function modelQualityBand(modelId: string | undefined, provider?: string)
 
 /** Family when we know one; otherwise the un-numbered provider id (`zai` from `zai-account-2`). */
 function accountGroup(id: string, qwenProvider: string): string {
+	// Share Anthropic's routing preference, never its credential/refresh lifecycle.
+	if (id === "pi-claude-code-provider") return "anthropic";
 	return classifyProvider(id, qwenProvider) ?? id.replace(/-account-\d+$/, "");
 }
 
