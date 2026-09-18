@@ -11602,6 +11602,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const staleError = () => sessionClosed || errorEpoch !== chainEpoch || userAbortedChain || ctx.signal?.aborted;
 		const message = (event as any).message;
 		if (message?.role !== "assistant" || !automaticFailoverEnabled()) return;
+		// Pi may retry on the selected fallback before it settles. Any final response from
+		// that destination consumes the old handoff; its own error gets classified below.
+		if (currentPromptSwitch?.to === `${message.provider}/${message.model}`) {
+			currentPromptSwitch = undefined;
+		}
 		if (message.stopReason !== "error") {
 			// A model reply that is not an error is a request that went out and came back — the
 			// second, independent witness for the governor, so a host that reports responses
@@ -11862,6 +11867,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		if (!config.enabled || !config.autoContinue || userAbortedChain) return;
+		// agent_end precedes Pi's retry/compaction loop. Do not queue a second resume
+		// while the host still owns this run; agent_settled is the final boundary.
+		if (!ctx.isIdle()) return;
+		await maybeDispatchContinuation(ctx);
+	});
+
+	safeOn("agent_settled", async (_event, ctx) => {
+		if (!automaticFailoverEnabled() || !ctx.isIdle()) return;
 		await maybeDispatchContinuation(ctx);
 	});
 

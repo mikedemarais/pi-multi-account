@@ -6160,7 +6160,7 @@ test("session_before_compact: a timeout on the first live account tries the next
 	assert.equal(result?.compaction?.summary, COMPACTION_SUMMARY.summary);
 });
 
-test("the wait-for-idle before a resume is bounded — never an infinite busy-loop", async () => {
+test("a busy agent_end defers resume without waiting inside Pi's retry boundary", async () => {
 	const t = setup({
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
 		idle: false,
@@ -6168,21 +6168,20 @@ test("the wait-for-idle before a resume is bounded — never an infinite busy-lo
 	});
 	const err = assistantError("anthropic", "claude-opus-4-8", "429 rate limit");
 	await t.fire("message_end", { message: err });
-	// Deliberately keep the session non-idle so the resume's wait MUST time out instead of
-	// spinning forever, then return without ever calling continueAgent.
+	// agent_end is not the final boundary: Pi may still retry. Return without
+	// waiting for idleness inside the event that the host must finish first.
 	await t.fire("agent_end", { messages: [err] });
 	assert.equal(
 		t.rec.continueCalls.length,
 		0,
 		"must not call continueAgent while the prior turn never goes idle",
 	);
-	assert.ok(
-		t.rec.notifies.some((n) => /did not go idle/i.test(n)),
-		"the bounded wait surfaces a clear, recoverable notice",
-	);
+	assert.ok(!t.rec.notifies.some((n) => /did not go idle/i.test(n)));
+	assert.equal(t.rec.sent.length, 0, "do not queue a duplicate retry either");
+	await t.fire("session_shutdown");
 });
 
-test("a 'still busy' auto-retry resumes the SAME model — it never downgrades gpt-5.5 to gpt-5.4 on the same account", async () => {
+test("a deferred resume after agent_settled keeps the SAME model", async () => {
 	// Reproduces the reported log: "openai-codex-account-4/gpt-5.5 → openai-codex-account-4/gpt-5.4
 	// (previous turn was still busy; auto-retry)". A busy-retry is a TIMING issue, not a model
 	// failure — the same account's quota is shared, so dropping to gpt-5.4 escapes nothing and
@@ -6198,8 +6197,8 @@ test("a 'still busy' auto-retry resumes the SAME model — it never downgrades g
 			autoContinue: true,
 		},
 	});
-	// anthropic hits a limit and we switch to the codex account on gpt-5.5. The prior turn never
-	// goes idle in time, so a "still busy" auto-retry is armed for openai-codex-account-2/gpt-5.5.
+	// Anthropic's limit selects Codex gpt-5.5. Let Pi finish its retry loop before
+	// resuming; waiting for settlement must not be treated as a model failure.
 	const err = assistantError("anthropic", "claude-opus-4-8", "429 rate limit");
 	await t.fire("message_end", { message: err });
 	assert.deepEqual(
@@ -6207,15 +6206,11 @@ test("a 'still busy' auto-retry resumes the SAME model — it never downgrades g
 		["openai-codex-account-2/gpt-5.5"],
 		"the switch lands on the newest model",
 	);
-	// Keep the session non-idle so the resume's bounded wait times out and arms a busy auto-retry.
 	await t.fire("agent_end", { messages: [err] });
-	assert.ok(
-		/still busy/i.test(t.readState().pendingReason ?? ""),
-		"a busy auto-retry must be armed (not a model failure)",
-	);
-	// The turn frees up; let the auto-resume wake fire.
+	assert.equal(t.rec.continueCalls.length, 0, "Pi still owns the current run");
+	// The host finishes without recovering; resume once at its settled boundary.
 	t.setIdle(true);
-	await wait(250);
+	await t.fire("agent_settled");
 	assert.ok(
 		!t.rec.setModels.some((m) => m.endsWith("/gpt-5.4")),
 		`busy-retry must NEVER downgrade to gpt-5.4; got: ${t.rec.setModels.join(", ")}`,
