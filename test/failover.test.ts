@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
-import { VERSION as PI_HOST_VERSION } from "@earendil-works/pi-coding-agent";
+import { VERSION as PI_HOST_VERSION, ExtensionRunner, createExtensionRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { piAutoPersistsSelectedModel } from "../pi-contract.ts";
 import { childFacingAuthEntryForSlot } from "../slot-proxy-auth.ts";
 import { XAI_SUBSCRIPTION_USAGE_URL, ZAI_CODING_CN_USAGE_URL } from "../usage.ts";
@@ -102,7 +102,7 @@ const {
 	persistRefreshedCredentials,
 	sameModelIdentity,
 } = (await import("../index.ts")) as {
-	default: (pi: any) => void;
+	default: (pi: any, options?: import("../index.ts").MultiAccountOptions) => void;
 	explicitCliSelections: (
 		argv?: readonly string[],
 	) => { model: boolean; thinking: boolean };
@@ -317,6 +317,7 @@ function setup(opts: {
 		headers?: Record<string, string>;
 	};
 	compactFn?: (...args: any[]) => Promise<any>;
+	codexCompaction?: (...args: any[]) => Promise<any>;
 	/**
 	 * A host whose `ctx.compact()` answers through NEITHER callback.
 	 *
@@ -716,7 +717,7 @@ function setup(opts: {
 	else delete process.env.PI_SUBAGENT_CHILD;
 	process.argv = ["node", "pi", ...(opts.cliArgs ?? [])];
 	try {
-		piMultiAccount(pi);
+		piMultiAccount(pi, { codexCompaction: opts.codexCompaction });
 	} finally {
 		process.argv = previousArgv;
 		if (previousSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
@@ -806,6 +807,7 @@ function setup(opts: {
 	return {
 		ctx,
 		rec,
+		handlers: events,
 		fire,
 		setIdle,
 		setCurrent,
@@ -5755,6 +5757,41 @@ test("startup capability preflight: a fully-capable host raises NO capability no
 		),
 		"nothing is degraded on a normal host, so no capability warning appears",
 	);
+});
+
+test("Codex delegate owns compaction and fails closed without reaching the old summarizer", async () => {
+	for (const outcome of ["success", "throw", "undefined", "cancel", "aborted", "wrong-boundary", "invalid-tokens"]) {
+		let calls = 0;
+		const t = setup({
+			current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+			compactFn: async () => { assert.fail("old compactor must not run"); },
+			codexCompaction: async () => {
+				calls++;
+				if (outcome === "throw") throw new Error("synthetic error");
+				if (outcome === "undefined") return undefined;
+				if (outcome === "cancel") return { cancel: true };
+				return { compaction: { summary: "portable", firstKeptEntryId: outcome === "wrong-boundary" ? "bad" : "e1", tokensBefore: outcome === "invalid-tokens" ? NaN : 1000 } };
+			},
+		});
+		t.ctx.model.api = "openai-codex-responses";
+		const runner = new ExtensionRunner([{ path: "synthetic", handlers: new Map(Object.entries(t.handlers)) }] as any,
+			createExtensionRuntime(), AGENT_DIR, SessionManager.inMemory(AGENT_DIR), t.ctx.modelRegistry);
+		runner.bindCore({} as any, { getModel: () => t.ctx.model } as any);
+		const result: any = await runner.emit({ type: "session_before_compact", reason: "manual", preparation: { firstKeptEntryId: "e1" }, signal: { aborted: outcome === "aborted" } } as any);
+		assert.equal(calls, outcome === "aborted" ? 0 : 1);
+		if (outcome === "success") assert.equal(result.compaction.summary, "portable");
+		else assert.equal(result.cancel, true, outcome);
+	}
+});
+
+test("Codex delegate leaves non-Codex and exempt providers unchanged", async () => {
+	for (const provider of ["anthropic", "openai-codex-account-2"]) {
+		const t = setup({ current: { provider, id: "gpt-5.5" },
+			config: provider.startsWith("openai") ? { neverFailoverProviders: [provider] } : {},
+			codexCompaction: async () => { assert.fail("delegate must not run"); },
+		});
+		assert.equal(await t.fire("session_before_compact", { reason: "manual", signal: { aborted: false } }), undefined);
+	}
 });
 
 test("session_before_compact: leaves Pi's native compaction alone when the active account is healthy", async () => {

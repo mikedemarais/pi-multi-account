@@ -48,7 +48,7 @@ import { Readable } from "node:stream";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionBeforeCompactEvent, CompactionResult } from "@earendil-works/pi-coding-agent";
 import {
 	CURSOR_BASE,
 	CURSOR_PROXY_PLACEHOLDER_KEY,
@@ -3916,7 +3916,13 @@ interface HostCompletionRouterAPI {
 	unregisterCompletionRouter?(): void;
 }
 
-export default function piMultiAccount(pi: ExtensionAPI) {
+export const supportsCodexCompactionDelegate = true;
+export interface MultiAccountOptions {
+	codexCompaction?: (event: SessionBeforeCompactEvent, ctx: ExtensionContext) =>
+		Promise<{ compaction: CompactionResult } | { cancel: true }>;
+}
+
+export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOptions = {}) {
 	// Warm up the OAuth helpers before any provider registration: providers are
 	// registered synchronously below and their `usesCallbackServer`/`getApiKey`
 	// read from the cached module. Deliberately NON-fatal — if pi-ai's oauth entry
@@ -11176,6 +11182,27 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	safeOn("session_before_compact", async (event: any, ctx: any) => {
 		if (!automaticFailoverEnabled() || isFailoverExempt(ctx.model?.provider)) return undefined;
 		if (event?.reason === "overflow") lastContextOverflowAt = Date.now();
+		if (options.codexCompaction && /^openai-codex(?:-account-[1-9]\d*)?$/.test(ctx.model?.provider ?? "") && ctx.model?.api === "openai-codex-responses") {
+			// This is the sole owner for opted-in Codex work. Never leak a throw/undefined
+			// through safeOn: Pi would silently run its untimed default compactor.
+			try {
+				if (event.signal?.aborted || sessionClosed) return compactionCancelled("compaction aborted");
+				if (queuedUserInputs.length > 0) {
+					const flushDelay = nextModelAvailabilityDelayMs(ctx);
+					if (flushDelay !== undefined && flushDelay <= QUEUE_FLUSH_SOON_MS)
+						return compactionCancelled("compaction cancelled: failover queue must flush");
+				}
+				const owned = await options.codexCompaction(event, ctx);
+				if (event.signal?.aborted || sessionClosed || (owned && "cancel" in owned && owned.cancel)) return compactionCancelled("compaction aborted");
+				if (owned && "compaction" in owned && owned.compaction?.summary?.trim()
+					&& Number.isFinite(owned.compaction.tokensBefore) && owned.compaction.tokensBefore >= 0
+					&& owned.compaction.firstKeptEntryId === event.preparation?.firstKeptEntryId)
+					return owned;
+				return compactionCancelled("Codex compaction delegate returned no valid result");
+			} catch {
+				return compactionCancelled("Codex compaction delegate failed; previous history preserved");
+			}
+		}
 		const result = await runHealthyCompaction(event, ctx);
 		if (result !== undefined) return result;
 		// The host runs its own default compaction on the ACTIVE account with no timeout.
@@ -11882,5 +11909,5 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// createAgentSession's getModel(cursor, cursor-grok-4.6) runs AFTER fallback
 	// models are registered, so the host restore does not print
 	// "Could not restore model" and dump the session onto kimi/anthropic.
-	return cursorReady;
+	return cursorReady?.then(() => {});
 }
