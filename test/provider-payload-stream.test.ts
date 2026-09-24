@@ -19,6 +19,23 @@ test("provider payload wrapper composes async caller replacement and forwards st
 	assert.equal(forwarded.onResponse, onResponse);
 });
 
+test("Anthropic payload wrapper preserves tools declared by a Pi transcript", async () => {
+	let request: any;
+	const wrapped = createPayloadStream((payload) => payload);
+	const model = { api: "anthropic-messages", provider: "anthropic", id: "claude-opus-5-5",
+		baseUrl: "https://fixture.invalid", reasoning: true, input: ["text"], contextWindow: 10000,
+		maxTokens: 100, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+	const stream = wrapped(model, { messages: [
+		{ role: "system", content: "Test", toolsAdded: [{ name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }], timestamp: 0 },
+		{ role: "user", content: "Read a file", timestamp: 1 },
+	] }, { apiKey: "fixture", maxRetries: 0, fetch: async (_url: any, init: any) => {
+		request = JSON.parse(init.body);
+		return new Response(JSON.stringify({ error: { message: "fixture finished" } }), { status: 400 });
+	} });
+	await stream.result();
+	assert.deepEqual(request.tools?.map((tool: any) => tool.name), ["read"]);
+});
+
 test("Cursor public provider stream keeps independent sessions isolated without host events", async () => {
 	const bodies: any[] = [];
 	for (const sessionId of ["child-one", "child-two"]) {

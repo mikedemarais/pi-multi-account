@@ -3258,7 +3258,8 @@ test("public Anthropic and Qwen provider streams shape native requests without s
 			id: anthropic ? "claude-sonnet-4-6" : "qwen-max", baseUrl: "https://fixture.invalid/v1",
 			reasoning: true, input: ["text"], contextWindow: 10000, maxTokens: 100,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: { supportsDeveloperRole: true },
-		}, { systemPrompt: "fixture instructions", messages: [{ role: "user", content: "fixture task", timestamp: 0 }] }, {
+		}, { messages: [{ role: "system", content: "fixture instructions", timestamp: 0 },
+			{ role: "user", content: "fixture task", timestamp: 1 }] }, {
 			apiKey: anthropic ? "sk-ant-oat01-fixture" : "fixture", maxRetries: 0,
 			onPayload: async (payload: any) => ({ ...payload, callerMarker: true }),
 			fetch: async (_url: any, init: any) => {
