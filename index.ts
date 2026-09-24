@@ -3542,7 +3542,7 @@ const MINIMAL_ANTHROPIC_OAUTH_PROMPT = [
 ].join("\n");
 const CLAUDE_CODE_IDENTITY_PREFIX =
 	"You are Claude Code, Anthropic's official CLI";
-const CLAUDE_CODE_VERSION = "2.1.274";
+const CLAUDE_CODE_VERSION = "2.1.281";
 const BILLING_HEADER_SALT = "59cf53e54c78";
 const BILLING_HEADER_POSITIONS = [4, 7, 20] as const;
 const CLAUDE_CODE_ENTRYPOINT = "sdk-cli";
