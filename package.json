@@ -50,6 +50,7 @@
     "cursor-bridge.ts",
     "cursor-model-name.ts",
     "compaction-summary.ts",
+    "anthropic-compaction.ts",
     "context-guard.ts",
     "completion-route-planner.ts",
     "provider-priority.ts",

@@ -20,7 +20,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
-import { VERSION as PI_HOST_VERSION, ExtensionRunner, createExtensionRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import { VERSION as PI_HOST_VERSION, ExtensionRunner, createExtensionRuntime, SessionManager, convertToLlm } from "@earendil-works/pi-coding-agent";
+import { getModel, streamSimple } from "@earendil-works/pi-ai/compat";
 import { piAutoPersistsSelectedModel } from "../pi-contract.ts";
 import { childFacingAuthEntryForSlot } from "../slot-proxy-auth.ts";
 import { XAI_SUBSCRIPTION_USAGE_URL, ZAI_CODING_CN_USAGE_URL } from "../usage.ts";
@@ -318,6 +319,7 @@ function setup(opts: {
 	};
 	compactFn?: (...args: any[]) => Promise<any>;
 	codexCompaction?: (...args: any[]) => Promise<any>;
+	anthropicNativeCompaction?: boolean;
 	/**
 	 * A host whose `ctx.compact()` answers through NEITHER callback.
 	 *
@@ -607,6 +609,8 @@ function setup(opts: {
 	};
 
 	const pi: any = {
+		getActiveTools: () => ["lookup"],
+		getAllTools: () => [{ name: "lookup", description: "Synthetic", parameters: { type: "object", properties: {} } }],
 		events: {
 			on: (name: string, handler: (payload: any) => void) => {
 				const handlers = busEvents.get(name) ?? [];
@@ -717,7 +721,7 @@ function setup(opts: {
 	else delete process.env.PI_SUBAGENT_CHILD;
 	process.argv = ["node", "pi", ...(opts.cliArgs ?? [])];
 	try {
-		piMultiAccount(pi, { codexCompaction: opts.codexCompaction });
+		piMultiAccount(pi, { codexCompaction: opts.codexCompaction, anthropicNativeCompaction: opts.anthropicNativeCompaction });
 	} finally {
 		process.argv = previousArgv;
 		if (previousSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
@@ -5782,6 +5786,62 @@ test("Codex delegate owns compaction and fails closed without reaching the old s
 		assert.equal(calls, outcome === "aborted" ? 0 : 1);
 		if (outcome === "success") assert.equal(result.compaction.summary, "portable");
 		else assert.equal(result.cancel, true, outcome);
+	}
+});
+
+test("Anthropic native compaction: signed summary when enabled, Pi's summary on failure, replay before shaping", async () => {
+	const slot = { ...(getModel("anthropic", "claude-opus-5-5") as any), provider: "anthropic-account-2" };
+	const realFetch = globalThis.fetch;
+	const requests: any[] = [];
+	let status = 200;
+	globalThis.fetch = (async (_url: any, init: any) => {
+		requests.push(JSON.parse(init.body));
+		return status === 200 ? new Response(JSON.stringify({ model: slot.id, stop_reason: "compaction",
+			content: [{ type: "compaction", content: "SIGNED", signature: "sig" }], usage: { iterations: [{ type: "compaction", input_tokens: 1 }] } }))
+			: new Response("provider body", { status });
+	}) as any;
+	const make = (enabled: boolean) => {
+		const t = setup({ current: { provider: slot.provider, id: slot.id }, anthropicNativeCompaction: enabled });
+		const sm = SessionManager.inMemory(AGENT_DIR);
+		const first = sm.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		Object.assign(t.ctx, { model: slot, sessionManager: sm, getSystemPrompt: () => "SYSTEM", thinkingLevel: "off" });
+		t.ctx.modelRegistry.streamSimple = (m: any, c: any, o: any) => streamSimple(m, c, { ...o, apiKey: "sk-ant-api-test" });
+		const event = { reason: "threshold", signal: new AbortController().signal, preparation: { firstKeptEntryId: first, tokensBefore: 10,
+			messagesToSummarize: [{ role: "user", content: "old", timestamp: 0 }], turnPrefixMessages: [], settings: { reserveTokens: 16_384 } } };
+		return { t, sm, first, event };
+	};
+	try {
+		const on = make(true);
+		const native: any = await on.t.fire("session_before_compact", on.event);
+		assert.equal(native.compaction.summary, "SIGNED");
+		assert.equal(requests.at(-1).compaction.type, "summarize");
+		assert.equal(requests.at(-1).tools[0].name, "lookup", "active tools reach the summary request");
+		on.sm.appendCompaction(native.compaction.summary, native.compaction.firstKeptEntryId, 10, native.compaction.details, true);
+		const payload = { model: slot.id, stream: true, messages: convertToLlm(on.sm.buildSessionContext().messages)
+			.map((message: any) => ({ role: message.role, content: [{ type: "text", text: message.content[0].text ?? message.content }] })) };
+		const replayed: any = await on.t.beforeReq(payload);
+		assert.deepEqual(replayed.messages[0].content[0], { type: "compaction", content: "SIGNED", signature: "sig" });
+		assert(replayed.betas.includes("compact-2026-09-04"));
+
+		const off = make(false);
+		requests.length = 0;
+		const existing = await off.t.fire("session_before_compact", off.event);
+		assert.equal(requests.length, 0, "disabled by default");
+
+		status = 500;
+		const failing = make(true);
+		assert.deepEqual(await failing.t.fire("session_before_compact", failing.event), existing, "failure continues exactly like the feature being off");
+		assert.equal(requests.length, 1);
+		assert(failing.t.rec.notifies.some((n: string) => n === "Anthropic native compaction unavailable (HTTP 500); using Pi's summary."));
+		off.sm.appendCompaction("SIGNED", off.first, 10, { anthropicNative: { ...native.compaction.details.anthropicNative, firstKeptEntryId: off.first } }, true);
+		const plain = { model: slot.id, stream: true, messages: convertToLlm(off.sm.buildSessionContext().messages)
+			.map((message: any) => ({ role: message.role, content: [{ type: "text", text: message.content[0].text ?? message.content }] })) };
+		assert.deepEqual(off.t.beforeReq(structuredClone(plain)), plain, "no replay when disabled");
+		const twin = make(true);
+		twin.t.ctx.sessionManager = off.sm;
+		assert.notDeepEqual(await twin.t.beforeReq(structuredClone(plain)), plain, "control: the same session replays when enabled");
+	} finally {
+		globalThis.fetch = realFetch;
 	}
 });
 

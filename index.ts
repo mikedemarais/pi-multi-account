@@ -3917,9 +3917,12 @@ interface HostCompletionRouterAPI {
 }
 
 export const supportsCodexCompactionDelegate = true;
+export const supportsAnthropicNativeCompaction = true;
 export interface MultiAccountOptions {
 	codexCompaction?: (event: SessionBeforeCompactEvent, ctx: ExtensionContext) =>
 		Promise<{ compaction: CompactionResult } | { cancel: true }>;
+	/** Signed Anthropic compaction with text fallback; see anthropic-compaction.ts. */
+	anthropicNativeCompaction?: boolean;
 }
 
 export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOptions = {}) {
@@ -3930,6 +3933,8 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	// still loads and every non-OAuth account keeps working; only subscription
 	// logins are unavailable, and the user is told once at session start.
 	const oauthUnavailable = piAiOauthUnavailableReason();
+	// Lazy: the module imports Pi's convertToLlm, which nothing else here needs.
+	const anthropicCompaction = options.anthropicNativeCompaction ? import("./anthropic-compaction.ts") : undefined;
 	let subagentChild = isSubagentChildProcess();
 	let hostOwnsSessionModel = false;
 	let startupModel: { provider: string; id: string } | undefined;
@@ -7643,6 +7648,23 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		return typeof mod?.compact === "function" ? mod.compact : undefined;
 	}
 
+	/** Signed Anthropic summary, or undefined to continue with Pi's text compaction. */
+	async function nativeAnthropicCompaction(event: any, ctx: any) {
+		const native = await anthropicCompaction!;
+		if (!native.eligible(ctx.model)) return undefined;
+		try {
+			const active = new Set(pi.getActiveTools());
+			const result = await native.nativeCompaction(event, ctx, pi.getAllTools().filter((tool) => active.has(tool.name)));
+			if (event?.reason === "overflow") lastContextOverflowAt = Date.now();
+			return result;
+		} catch (error) {
+			if (event?.signal?.aborted) return { cancel: true as const };
+			// Reasons are fixed strings or HTTP statuses; provider bodies are never surfaced.
+			ctx.ui?.notify?.(`Anthropic native compaction unavailable (${error instanceof Error ? error.message : "failed"}); using Pi's summary.`, "warning");
+			return undefined;
+		}
+	}
+
 	function compactionCancelled(reason: string): {
 		cancel: true;
 		reason: string;
@@ -10408,7 +10430,15 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		return undefined;
 	});
 
-	safeOn("before_provider_request", (event: any, ctx?: any) => {
+	safeOn("before_provider_request", (event: any, ctx?: any) =>
+		// Replay a signed Anthropic summary first: subscription shaping below derives its billing
+		// value from the first user message, so it must see the final message list.
+		anthropicCompaction
+			? anthropicCompaction.then((native) => shapeProviderRequest(event, ctx, native.replay(event.payload, ctx)))
+			: shapeProviderRequest(event, ctx));
+
+	function shapeProviderRequest(event: any, ctx?: any, replayed?: unknown) {
+		const input = replayed ?? event.payload;
 		// A payload is being built, so a request is on its way out. This is the earliest and most
 		// reliable place to say "the session is not spinning", and it is a hook this extension
 		// already depends on — so the governor is watching something known to work on this host
@@ -10417,8 +10447,8 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			| { kind?: string; sessionId?: string; model?: RouteModelRef }
 			| undefined;
 		if (request?.kind !== "background") noteProviderRequestObserved();
-		const shaped = shapeAnthropicOAuthPayload(event.payload);
-		const payload = (shaped ?? event.payload) as
+		const shaped = shapeAnthropicOAuthPayload(input);
+		const payload = (shaped ?? input) as
 			| Record<string, unknown>
 			| undefined;
 		const provider = request?.model?.provider ?? ctx?.model?.provider;
@@ -10432,7 +10462,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			}
 		}
 		return shaped;
-	});
+	}
 
 	// ----- lifecycle hooks --------------------------------------------------
 
@@ -11180,6 +11210,8 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	// the summary on a healthy account instead. If that cannot finish, we CANCEL — never return
 	// undefined onto a spent account, because Pi's default has no timeout of its own.
 	safeOn("session_before_compact", async (event: any, ctx: any) => {
+		const native = anthropicCompaction && await nativeAnthropicCompaction(event, ctx);
+		if (native) return native;
 		if (!automaticFailoverEnabled() || isFailoverExempt(ctx.model?.provider)) return undefined;
 		if (event?.reason === "overflow") lastContextOverflowAt = Date.now();
 		if (options.codexCompaction && /^openai-codex(?:-account-[1-9]\d*)?$/.test(ctx.model?.provider ?? "") && ctx.model?.api === "openai-codex-responses") {
