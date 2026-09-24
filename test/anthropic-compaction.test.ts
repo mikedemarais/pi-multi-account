@@ -62,15 +62,23 @@ test("replay leaves the text summary for another slot, model, edited summary or 
 	] as const) {
 		const { ctx } = session(model as any, native as any);
 		const { headers, body } = await turn(ctx);
-		assert.equal(body.messages[0].content[0].text.includes("SIGNED SUMMARY"), true, label);
+		assert.equal(body.messages[0].role, "user", label);
 		assert(!(headers.get("anthropic-beta") ?? "").includes(COMPACTION_BETA), label);
 	}
+	// A text-summary request (from another slot) replays once, but not when the summary is ambiguous.
+	const { body } = await turn(session({ ...slot, provider: "anthropic-account-3" }).ctx);
+	const { ctx } = session();
+	assert(replay(body, ctx), "control: a single summary message replays");
+	assert.equal(replay({ ...body, messages: [...body.messages, body.messages[0]] }, ctx), undefined, "an ambiguous summary match is left alone");
 });
 
 test("summary parsing requires one signed block and totals every iteration", async () => {
 	const parsed = parseSummary(await reply().json(), slot.id);
 	assert.equal(parsed.summary, "SIGNED SUMMARY");
-	assert.deepEqual(parsed.usage, { input: 101, output: 20, cacheRead: 5, cacheWrite: 0, totalTokens: 126 });
+	assert.deepEqual(parsed.usage, { input: 101, output: 20, cacheRead: 5, cacheWrite: 0, cacheWrite1h: 0, totalTokens: 126 });
+	const withLongWrite = parseSummary({ model: slot.id, stop_reason: "compaction", content: [block()], usage: { iterations: [
+		{ type: "compaction", input_tokens: 1, cache_creation_input_tokens: 30, cache_creation: { ephemeral_1h_input_tokens: 20 } }] } }, slot.id);
+	assert.equal(withLongWrite.usage.cacheWrite1h, 20, "1-hour writes are priced separately by calculateCost");
 	for (const bad of [{ stop_reason: "end_turn" }, { model: "claude-opus-5" }, { content: [{ type: "compaction", content: "x" }] }, { usage: { iterations: [] } }]) {
 		assert.throws(() => parseSummary({ ...(JSON.parse(JSON.stringify({ model: slot.id, stop_reason: "compaction", content: [block()], usage: { iterations: [{ type: "compaction" }] } }))), ...bad }, slot.id));
 	}

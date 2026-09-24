@@ -5822,6 +5822,9 @@ test("Anthropic native compaction: signed summary when enabled, Pi's summary on 
 		const replayed: any = await on.t.beforeReq(payload);
 		assert.deepEqual(replayed.messages[0].content[0], { type: "compaction", content: "SIGNED", signature: "sig" });
 		assert(replayed.betas.includes("compact-2026-09-04"));
+		// Subscription billing hashes the first user text, so it must be computed after the replay.
+		const billed: any = await on.t.beforeReq({ ...structuredClone(payload), system: [{ type: "text", text: "You are Claude Code, Anthropic's official CLI for working." }] });
+		assert.match(billed.system[0].text, new RegExp(`cch=${createHash("sha256").update("hello").digest("hex").slice(0, 5)};`));
 
 		const off = make(false);
 		requests.length = 0;
@@ -5832,7 +5835,7 @@ test("Anthropic native compaction: signed summary when enabled, Pi's summary on 
 		const failing = make(true);
 		assert.deepEqual(await failing.t.fire("session_before_compact", failing.event), existing, "failure continues exactly like the feature being off");
 		assert.equal(requests.length, 1);
-		assert(failing.t.rec.notifies.some((n: string) => n === "Anthropic native compaction unavailable (HTTP 500); using Pi's summary."));
+		assert(failing.t.rec.notifies.some((n: string) => n === "Anthropic native compaction unavailable (HTTP 500); using a text summary."));
 		off.sm.appendCompaction("SIGNED", off.first, 10, { anthropicNative: { ...native.compaction.details.anthropicNative, firstKeptEntryId: off.first } }, true);
 		const plain = { model: slot.id, stream: true, messages: convertToLlm(off.sm.buildSessionContext().messages)
 			.map((message: any) => ({ role: message.role, content: [{ type: "text", text: message.content[0].text ?? message.content }] })) };

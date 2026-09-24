@@ -3933,8 +3933,11 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	// still loads and every non-OAuth account keeps working; only subscription
 	// logins are unavailable, and the user is told once at session start.
 	const oauthUnavailable = piAiOauthUnavailableReason();
-	// Lazy: the module imports Pi's convertToLlm, which nothing else here needs.
-	const anthropicCompaction = options.anthropicNativeCompaction ? import("./anthropic-compaction.ts") : undefined;
+	// Lazy: the module imports Pi's convertToLlm, which nothing else here needs. A load failure
+	// disables the feature instead of failing every provider request and compaction.
+	const anthropicCompaction = options.anthropicNativeCompaction
+		? import("./anthropic-compaction.ts").catch((error) => { reportExtensionError("anthropic compaction load", error); return undefined; })
+		: undefined;
 	let subagentChild = isSubagentChildProcess();
 	let hostOwnsSessionModel = false;
 	let startupModel: { provider: string; id: string } | undefined;
@@ -7650,17 +7653,15 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 
 	/** Signed Anthropic summary, or undefined to continue with Pi's text compaction. */
 	async function nativeAnthropicCompaction(event: any, ctx: any) {
-		const native = await anthropicCompaction!;
-		if (!native.eligible(ctx.model)) return undefined;
+		const native = await anthropicCompaction;
+		if (!native?.eligible(ctx.model)) return undefined;
 		try {
 			const active = new Set(pi.getActiveTools());
-			const result = await native.nativeCompaction(event, ctx, pi.getAllTools().filter((tool) => active.has(tool.name)));
-			if (event?.reason === "overflow") lastContextOverflowAt = Date.now();
-			return result;
+			return await native.nativeCompaction(event, ctx, pi.getAllTools().filter((tool) => active.has(tool.name)));
 		} catch (error) {
 			if (event?.signal?.aborted) return { cancel: true as const };
 			// Reasons are fixed strings or HTTP statuses; provider bodies are never surfaced.
-			ctx.ui?.notify?.(`Anthropic native compaction unavailable (${error instanceof Error ? error.message : "failed"}); using Pi's summary.`, "warning");
+			ctx.ui?.notify?.(`Anthropic native compaction unavailable (${error instanceof Error ? error.message : "failed"}); using a text summary.`, "warning");
 			return undefined;
 		}
 	}
@@ -10434,7 +10435,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		// Replay a signed Anthropic summary first: subscription shaping below derives its billing
 		// value from the first user message, so it must see the final message list.
 		anthropicCompaction
-			? anthropicCompaction.then((native) => shapeProviderRequest(event, ctx, native.replay(event.payload, ctx)))
+			? anthropicCompaction.then((native) => shapeProviderRequest(event, ctx, native?.replay(event.payload, ctx)))
 			: shapeProviderRequest(event, ctx));
 
 	function shapeProviderRequest(event: any, ctx?: any, replayed?: unknown) {
@@ -11210,10 +11211,13 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	// the summary on a healthy account instead. If that cannot finish, we CANCEL — never return
 	// undefined onto a spent account, because Pi's default has no timeout of its own.
 	safeOn("session_before_compact", async (event: any, ctx: any) => {
-		const native = anthropicCompaction && await nativeAnthropicCompaction(event, ctx);
-		if (native) return native;
 		if (!automaticFailoverEnabled() || isFailoverExempt(ctx.model?.provider)) return undefined;
 		if (event?.reason === "overflow") lastContextOverflowAt = Date.now();
+		// Any native failure falls through to the ordinary compaction path below.
+		if (anthropicCompaction) {
+			const native = await nativeAnthropicCompaction(event, ctx);
+			if (native) return native;
+		}
 		if (options.codexCompaction && /^openai-codex(?:-account-[1-9]\d*)?$/.test(ctx.model?.provider ?? "") && ctx.model?.api === "openai-codex-responses") {
 			// This is the sole owner for opted-in Codex work. Never leak a throw/undefined
 			// through safeOn: Pi would silently run its untimed default compactor.

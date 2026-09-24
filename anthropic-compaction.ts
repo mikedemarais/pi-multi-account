@@ -12,10 +12,12 @@
  * `convertToLlm`; the rest of the extension avoids value imports from Pi packages.
  */
 import { createHash } from "node:crypto";
+import { calculateCost, type Usage } from "@earendil-works/pi-ai";
 import { convertToLlm, type CompactionEntry, type ExtensionContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
 
 export const COMPACTION_BETA = "compact-2026-09-04";
-const TIMEOUT_MS = 120_000;
+// A non-streamed summary of a large context can take minutes; match the Codex deadline.
+const TIMEOUT_MS = 300_000;
 // Models Anthropic documents for on-demand compaction (per pi-anthropic-compat 0.0.5).
 const MODELS = new Set([
 	"claude-fable-5-1", "claude-fable-5", "claude-mythos-5-1", "claude-mythos-5", "claude-mythos-preview",
@@ -24,7 +26,7 @@ const MODELS = new Set([
 ]);
 
 type Json = Record<string, any>;
-type Model = { provider: string; id: string; api: string; baseUrl: string; maxTokens: number; cost?: Record<string, number> };
+type Model = { provider: string; id: string; api: string; baseUrl: string; maxTokens: number };
 export type NativeCheckpoint = { version: 1; provider: string; model: string; block: Json; summaryHash: string; firstKeptEntryId: string };
 
 const isRecord = (value: unknown): value is Json => !!value && typeof value === "object" && !Array.isArray(value);
@@ -72,8 +74,8 @@ function summaryMessageText(summary: string): string {
 
 /**
  * Replace Pi's text summary message with the signed block. Returns undefined (leave the
- * payload alone) unless exactly one matching summary message exists. The block leads the
- * next assistant turn when there is one, so roles still alternate.
+ * payload alone) unless exactly one matching summary message exists. The block joins the
+ * following assistant turn when one comes next; otherwise it is its own assistant turn.
  */
 export function replayCheckpoint(payload: unknown, entry: CompactionEntry | undefined, model: Model): Json | undefined {
 	const native = checkpointFor(entry, model);
@@ -124,12 +126,13 @@ export function parseSummary(response: Json, modelId: string) {
 	const block = signedBlock(response.content[0]);
 	const iterations = Array.isArray(response.usage?.iterations) ? response.usage.iterations : [];
 	if (!iterations.some((item: Json) => item?.type === "compaction")) throw new Error("missing compaction usage");
-	const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 };
+	const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0, totalTokens: 0 };
 	for (const item of iterations) {
 		usage.input += tokens(item.input_tokens);
 		usage.output += tokens(item.output_tokens);
 		usage.cacheRead += tokens(item.cache_read_input_tokens);
 		usage.cacheWrite += tokens(item.cache_creation_input_tokens);
+		usage.cacheWrite1h += tokens(item.cache_creation?.ephemeral_1h_input_tokens);
 	}
 	usage.totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
 	return { summary: block.content as string, block, usage };
@@ -191,11 +194,10 @@ export async function nativeCompaction(event: SessionBeforeCompactEvent, ctx: Ex
 	if (ctx.sessionManager.getLeafId() !== leaf || ctx.model?.id !== model.id || ctx.model?.provider !== model.provider) throw new Error("session changed");
 	const anthropicNative: NativeCheckpoint = { version: 1, provider: model.provider, model: model.id, block: parsed.block,
 		summaryHash: hash(parsed.summary), firstKeptEntryId: preparation.firstKeptEntryId };
-	const price = (key: "input" | "output" | "cacheRead" | "cacheWrite") => parsed.usage[key] * (model.cost?.[key] ?? 0) / 1e6;
-	const cost = { input: price("input"), output: price("output"), cacheRead: price("cacheRead"), cacheWrite: price("cacheWrite"), total: 0 };
-	cost.total = cost.input + cost.output + cost.cacheRead + cost.cacheWrite;
+	const usage: Usage = { ...parsed.usage, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+	usage.cost = calculateCost(model as any, usage);
 	return { compaction: { summary: parsed.summary, firstKeptEntryId: preparation.firstKeptEntryId, tokensBefore: preparation.tokensBefore,
-		usage: { ...parsed.usage, cost }, details: { anthropicNative } } };
+		usage, details: { anthropicNative } } };
 }
 
 /** Replay for the foreground request of `ctx`'s session, or undefined when not applicable. */
