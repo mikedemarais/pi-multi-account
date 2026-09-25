@@ -3545,37 +3545,6 @@ const CLAUDE_CODE_IDENTITY_PREFIX =
 	"You are Claude Code, Anthropic's official CLI";
 const CLAUDE_CODE_VERSION = "2.1.281";
 
-/** Newer of two x.y.z versions; unparsable input loses. */
-export function newerClaudeCodeVersion(a: string, b: string | undefined): string {
-	const parse = (v: string | undefined) => /^(\d+)\.(\d+)\.(\d+)$/.exec(v ?? "")?.slice(1).map(Number);
-	const x = parse(a), y = parse(b);
-	if (!y) return a;
-	if (!x) return b!;
-	for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i]! > y[i]! ? a : b!;
-	return a;
-}
-
-/** Parse `claude --version` output such as "2.1.281 (Claude Code)". */
-export function parseClaudeCodeVersionOutput(output: string): string | undefined {
-	return /^\s*(\d+\.\d+\.\d+)\b/.exec(output)?.[1];
-}
-
-// New models can require a minimum Claude Code version (Opus 5.5 rejected
-// 2.1.274). A pinned fork cannot rely on the weekly bump, so advertise the
-// locally installed Claude Code when it is newer. Detected once, lazily.
-let effectiveClaudeCodeVersion: string | undefined;
-function claudeCodeVersion(): string {
-	if (effectiveClaudeCodeVersion) return effectiveClaudeCodeVersion;
-	let detected: string | undefined;
-	if (process.env.PI_MULTI_ACCOUNT_DETECT_CLAUDE_CODE_VERSION !== "0") {
-		try {
-			detected = parseClaudeCodeVersionOutput(execFileSync("claude", ["--version"], {
-				encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"],
-			}));
-		} catch { /* Claude Code not installed or slow: use the constant. */ }
-	}
-	return (effectiveClaudeCodeVersion = newerClaudeCodeVersion(CLAUDE_CODE_VERSION, detected));
-}
 const BILLING_HEADER_SALT = "59cf53e54c78";
 const BILLING_HEADER_POSITIONS = [4, 7, 20] as const;
 const CLAUDE_CODE_ENTRYPOINT = "sdk-cli";
@@ -3657,6 +3626,38 @@ function getFirstUserText(messages: ShapeMessageParam[]): string {
 		(block) => block.type === "text" && typeof block.text === "string",
 	);
 	return typeof firstTextBlock?.text === "string" ? firstTextBlock.text : "";
+}
+
+/** Newer of two x.y.z versions; unparsable input loses. */
+export function newerClaudeCodeVersion(a: string, b: string | undefined): string {
+	const parse = (v: string | undefined) => /^(\d+)\.(\d+)\.(\d+)$/.exec(v ?? "")?.slice(1).map(Number);
+	const x = parse(a), y = parse(b);
+	if (!y) return a;
+	if (!x) return b!;
+	for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i]! > y[i]! ? a : b!;
+	return a;
+}
+
+/** Parse `claude --version` output such as "2.1.281 (Claude Code)". */
+export function parseClaudeCodeVersionOutput(output: string): string | undefined {
+	return /^\s*(\d+\.\d+\.\d+)\b/.exec(output)?.[1];
+}
+
+// New models can require a minimum Claude Code version (Opus 5.5 rejected
+// 2.1.274). A pinned fork cannot rely on the weekly bump, so advertise the
+// locally installed Claude Code when it is newer. Detected once, lazily.
+let effectiveClaudeCodeVersion: string | undefined;
+function claudeCodeVersion(): string {
+	if (effectiveClaudeCodeVersion) return effectiveClaudeCodeVersion;
+	let detected: string | undefined;
+	if (process.env.PI_MULTI_ACCOUNT_DETECT_CLAUDE_CODE_VERSION !== "0") {
+		try {
+			detected = parseClaudeCodeVersionOutput(execFileSync("claude", ["--version"], {
+				encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"],
+			}));
+		} catch { /* Claude Code not installed or slow: use the constant. */ }
+	}
+	return (effectiveClaudeCodeVersion = newerClaudeCodeVersion(CLAUDE_CODE_VERSION, detected));
 }
 
 function buildBillingHeaderValue(
