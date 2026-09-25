@@ -57,9 +57,21 @@ test("the maintainer bump can unambiguously rewrite the constant", () => {
 test("the bumped constant is the one that ships in the OAuth billing header", () => {
 	// If CLAUDE_CODE_VERSION ever stops feeding the header, keeping it fresh is pointless work.
 	assert.ok(
-		indexSource.includes("cc_version=${CLAUDE_CODE_VERSION}"),
-		"CLAUDE_CODE_VERSION is no longer used to build the billing header",
+		indexSource.includes("newerClaudeCodeVersion(CLAUDE_CODE_VERSION, detected)") &&
+			indexSource.includes("cc_version=${version}"),
+		"CLAUDE_CODE_VERSION is no longer the floor of the billing header version",
 	);
+});
+
+test("a newer locally installed Claude Code wins over the constant, never an older one", async () => {
+	const { newerClaudeCodeVersion, parseClaudeCodeVersionOutput } = await import("../index.ts");
+	assert.equal(parseClaudeCodeVersionOutput("2.1.290 (Claude Code)\n"), "2.1.290");
+	assert.equal(parseClaudeCodeVersionOutput("command not found"), undefined);
+	assert.equal(newerClaudeCodeVersion("2.1.281", "2.1.290"), "2.1.290");
+	assert.equal(newerClaudeCodeVersion("2.1.281", "2.1.99"), "2.1.281");
+	assert.equal(newerClaudeCodeVersion("2.1.281", "2.2.0"), "2.2.0");
+	assert.equal(newerClaudeCodeVersion("2.1.281", undefined), "2.1.281");
+	assert.equal(newerClaudeCodeVersion("2.1.281", "garbage"), "2.1.281");
 });
 
 test("the version check never again depends on GitHub Actions opening a pull request", () => {

@@ -28,6 +28,8 @@ import { XAI_SUBSCRIPTION_USAGE_URL, ZAI_CODING_CN_USAGE_URL } from "../usage.ts
 
 const AGENT_DIR = mkdtempSync(join(tmpdir(), "pmacct-test-"));
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
+// Billing-header assertions pin the constant, not whatever Claude Code is installed locally.
+process.env.PI_MULTI_ACCOUNT_DETECT_CLAUDE_CODE_VERSION = "0";
 // The Cursor provider lives in a separate, optional repo. Point the bridge at a directory we
 // control so a test can toggle "installed" / "not installed" — the default is NOT installed,
 // which is what the overwhelming majority of users run.
