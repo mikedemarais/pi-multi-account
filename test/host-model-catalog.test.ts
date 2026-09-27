@@ -2,7 +2,7 @@
  * Pi's extension loader (jiti) gives this module a `require` that resolves
  * `@earendil-works/pi-ai` to the host's already-loaded copy. Numbered Claude slots must take
  * their canonical model metadata from there instead of loading this package's own pi-ai, which
- * re-evaluates the whole provider catalog and cost every Pi startup about 0.15s. Plain Node
+ * re-evaluates the whole provider catalog and cost every Pi startup about 0.13s. Plain Node
  * ESM has no `require`, so the lookup must still fall back to the package's own copy.
  */
 import { test } from "node:test";
@@ -15,10 +15,10 @@ import { fileURLToPath } from "node:url";
 
 const INDEX = join(dirname(fileURLToPath(import.meta.url)), "..", "index.ts");
 
-const DRIVER = `import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+const DRIVER = `import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-const agent = mkdtempSync(join(tmpdir(), "pmacct-hostcat-agent-"));
+const agent = process.argv[4];
+mkdirSync(agent);
 process.env.PI_CODING_AGENT_DIR = agent;
 process.env.PI_CURSOR_PROVIDER_ROOT = join(agent, "no-cursor");
 writeFileSync(join(agent, "auth.json"), JSON.stringify({
@@ -54,7 +54,7 @@ function run(mode: "host" | "own"): { models: string[]; hostCalls: number } {
 	try {
 		const driver = join(root, "driver.mjs");
 		writeFileSync(driver, DRIVER);
-		const stdout = execFileSync(process.execPath, [driver, INDEX, mode], { encoding: "utf8" });
+		const stdout = execFileSync(process.execPath, [driver, INDEX, mode, join(root, "agent")], { encoding: "utf8" });
 		const line = stdout.split("\n").find((l) => l.startsWith("__RESULT__"));
 		assert.ok(line, `driver produced no result:\n${stdout}`);
 		return JSON.parse(line.slice("__RESULT__".length));

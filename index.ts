@@ -433,7 +433,7 @@ function requirePiAiOauth(): PiAiOauthBridge {
  *
  * Under Pi's extension loader, jiti's `require` resolves `@earendil-works/pi-ai` to the
  * host's already-loaded compat entry, so prefer that: requiring this package's own copy
- * loads its whole provider catalog again and cost every Pi startup about 0.15s. Plain Node
+ * loads its whole provider catalog again and cost every Pi startup about 0.13s. Plain Node
  * ESM (the tests, other hosts) has no `require` and keeps the lookup below.
  */
 let piAiGetModelFn: ((provider: string, id: string) => any) | null | undefined;
