@@ -61,7 +61,9 @@ async function acquireAuthLock(
         // proper-lockfile's default throws from a timer, which would crash Pi. A compromise can
         // be noticed mid-exchange; modify() still writes the rotated token (re-reading the file
         // first) because dropping it would lose the only live credential.
-        onCompromised: (error: Error) => onCompromised?.(error),
+        onCompromised: (error: Error) => {
+          try { onCompromised?.(error); } catch { /* never throw from proper-lockfile's timer */ }
+        },
       });
     } catch (error: any) {
       const remainingMs = deadline - Date.now();
