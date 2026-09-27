@@ -10204,6 +10204,115 @@ test("a forced Cursor refresh loads the vendored provider, not the retired clone
 	uninstallCursorProvider();
 });
 
+// Every idle Pi window polls usage once a minute, and a 401 from that poll forces a refresh. When
+// the 8h Anthropic access token expires, all of them reach for the same one-use refresh token at
+// once. Spent outside Pi's auth.json lock, that race burned the live credential and forced a
+// manual /login roughly once a day.
+async function withAnthropicTokenEndpoint(
+	respond: (refreshToken: string) => Response,
+	run: (tokenRequests: string[]) => Promise<void>,
+) {
+	const tokenRequests: string[] = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = input instanceof Request ? input.url : String(input);
+		if (!url.endsWith("/v1/oauth/token")) return new Response("offline", { status: 503 });
+		const refreshToken = JSON.parse(String(init?.body ?? "{}")).refresh_token;
+		tokenRequests.push(refreshToken);
+		return respond(refreshToken);
+	}) as typeof fetch;
+	try {
+		await run(tokenRequests);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+test("a forced Anthropic refresh adopts the token another Pi window already rotated", async () => {
+	const provider = "anthropic-account-2";
+	await withAnthropicTokenEndpoint(
+		() =>
+			new Response(
+				JSON.stringify({ error: "invalid_grant", error_description: "Refresh token not found or invalid" }),
+				{ status: 400 },
+			),
+		async (tokenRequests) => {
+			const t = setup({
+				accounts: { [provider]: { type: "oauth", access: "a2-old", refresh: "a2-r1", expires: 1 } },
+				current: { provider, id: "claude-opus-4-8" },
+				config: { childProxy: false },
+				hostAuthStorage: "pi-0.84",
+			});
+			await t.fire("session_start");
+			const storage = t.ctx.modelRegistry.authStorage;
+			const modify = storage.modify;
+			let otherWindowRotated = false;
+			storage.modify = async (id: string, fn: (current: any) => any) => {
+				if (id === provider && !otherWindowRotated) {
+					// Another window held the auth.json lock and rotated the token first.
+					otherWindowRotated = true;
+					const data = JSON.parse(readFileSync(AUTH, "utf8"));
+					writeFileSync(AUTH, JSON.stringify({
+						...data,
+						[provider]: { type: "oauth", access: "a2-new", refresh: "a2-r2", expires: Date.now() + 8 * 3_600_000 },
+					}));
+				}
+				return modify(id, fn);
+			};
+
+			await finishError(
+				t,
+				provider,
+				"claude-opus-4-8",
+				"Your authentication token has been invalidated. Please try signing in again.",
+			);
+
+			assert.ok(otherWindowRotated, "the forced refresh must take the auth.json lock");
+			assert.deepEqual(tokenRequests, [], "the already-spent refresh token must never be sent");
+			assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))[provider].refresh, "a2-r2");
+			assert.ok(!t.readState().invalidatedByProvider?.[provider], "a lost race is not a dead account");
+		},
+	);
+});
+
+test("a forced Anthropic refresh spends the token once and persists the rotation", async () => {
+	const provider = "anthropic-account-2";
+	await withAnthropicTokenEndpoint(
+		() =>
+			new Response(
+				JSON.stringify({ access_token: "a2-new", refresh_token: "a2-r2", expires_in: 28_800 }),
+				{ status: 200 },
+			),
+		async (tokenRequests) => {
+			const t = setup({
+				accounts: { [provider]: { type: "oauth", access: "a2-old", refresh: "a2-r1", expires: 1 } },
+				current: { provider, id: "claude-opus-4-8" },
+				hostAuthStorage: "pi-0.84",
+			});
+			await t.fire("session_start");
+
+			await finishError(
+				t,
+				provider,
+				"claude-opus-4-8",
+				"Your authentication token has been invalidated. Please try signing in again.",
+			);
+
+			assert.deepEqual(tokenRequests, ["a2-r1"]);
+			// With the child proxy up, auth.json keeps the child-facing placeholder and the real
+			// credential lives in the parent-only sidecar.
+			const childFacing = JSON.parse(readFileSync(AUTH, "utf8"))[provider];
+			assert.equal(childFacing.type, "api_key", "OAuth must stay hidden from children");
+			const stored = JSON.parse(
+				readFileSync(join(AGENT_DIR, "pi-multi-account-proxy-oauth.json"), "utf8"),
+			)[provider];
+			assert.equal(stored.type, "oauth");
+			assert.equal(stored.access, "a2-new");
+			assert.equal(stored.refresh, "a2-r2", "the rotated token must be persisted");
+		},
+	);
+});
+
 // ---------------------------------------------------------------------------
 // The registry is Pi's, not ours: narrowing /model must not delete models
 // ---------------------------------------------------------------------------

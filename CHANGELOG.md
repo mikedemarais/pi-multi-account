@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Forced Anthropic OAuth refreshes (usage-poll 401s, auth-error recovery, slot proxy) now run under Pi's cross-process `auth.json` lock, like Codex refreshes. Every idle Pi window used to race for the same one-use refresh token when the 8h access token expired, which could burn the live credential and force a manual `/login` roughly once a day. A window that loses the race now adopts the rotated token instead of sending the spent one.
+
 - The Anthropic OAuth billing header now reports the locally installed Claude Code (`claude --version`) when it is newer than `CLAUDE_CODE_VERSION`, so a pinned install keeps working when a new model requires a newer client (Opus 5.5 rejected 2.1.274). Set `PI_MULTI_ACCOUNT_DETECT_CLAUDE_CODE_VERSION=0` to use only the constant.
 
 - `neverFailoverProviders` now also bypasses foreground startup/input preflights for unmanaged providers. Stale cooldowns, invalidations, or unknown auth no longer silently replace an opted-out route before its request. Automatic switch and pending-resume boundaries enforce the same exemption; explicit manual switches remain available.

@@ -90,6 +90,7 @@ test, not a one-off patch.
 | 64 | **Small new tool results do not repeatedly rewrite a guarded request's cached prefix.** Reapply existing stubs, then cross the soft threshold before adding another batch. | `context guard preserves the serialized prefix until the outgoing request crosses the soft line again` |
 | 65 | **Concurrent Codex refreshers adopt one persisted winner without exposing shadowed OAuth.** Exchange and sidecar persistence share Pi's credential lock. | `two OS processes serialize a shadowed Codex refresh through the production sidecar` |
 | 66 | **Quota is provider evidence, not an invented default.** GLM CN ignores MCP limits, stale/invalid windows and failed responses; xAI missing percentage remains unknown. | `test/zai-usage.test.ts` · `xAI treats an omitted modern percentage as unknown even for a valid period` |
+| 67 | **Concurrent forced Anthropic refreshes never spend a rotated token.** Idle windows that hit the same expired login adopt the winner's credential under Pi's lock, and the rotation lands in the sidecar when the slot is shadowed. | `a forced Anthropic refresh adopts the token another Pi window already rotated` · `a forced Anthropic refresh spends the token once and persists the rotation` |
 
 ## How to keep this honest
 

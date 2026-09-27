@@ -4878,11 +4878,35 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		try {
 			let refreshed: AuthEntry | undefined;
 			let persistedUnderLock = false;
-			if (family === "anthropic") {
-				refreshed = await refreshAnthropicCredentials(
-					entry,
-					undefined,
+			// Anthropic and Codex refresh tokens are one-use. Every idle Pi window runs this on a
+			// usage-poll 401, so all of them hit an expired token at once; spending it outside
+			// Pi's cross-process auth.json lock let them race for it and lose the only live
+			// credential. Under the lock, a waiter adopts the winner's token instead.
+			const refreshUnderLock = async (
+				refresh: (current: AuthEntry) => Promise<AuthEntry>,
+			): Promise<AuthEntry> => {
+				if (typeof authStorage?.modify !== "function") return refresh(entry);
+				const result = await refreshAndPersistWithStorageLock({
 					provider,
+					credentials: entry,
+					authStorage,
+					readLatest: () => readAuthFile()[provider],
+					refresh,
+					isShadowed: (stored) =>
+						isChildFacingPlaceholderForSlot(stored, provider),
+					persistShadowed: (credential) =>
+						writeProxyOAuthSidecar({
+							...readProxyOAuthSidecar(),
+							[provider]: credential,
+						}),
+				});
+				persistedUnderLock = true;
+				return result;
+			};
+			if (family === "anthropic") {
+				refreshed = await refreshUnderLock(
+					(current) =>
+						refreshAnthropicCredentials(current, undefined, provider) as Promise<AuthEntry>,
 				);
 			} else if (family === "openai-codex") {
 				const refreshCodex = async (current: AuthEntry) => {
@@ -4902,26 +4926,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 					}
 					return next;
 				};
-
-				if (typeof authStorage?.modify === "function") {
-					refreshed = await refreshAndPersistWithStorageLock({
-						provider,
-						credentials: entry,
-						authStorage,
-						readLatest: () => readAuthFile()[provider],
-						refresh: refreshCodex,
-						isShadowed: (stored) =>
-							isChildFacingPlaceholderForSlot(stored, provider),
-						persistShadowed: (credential) =>
-							writeProxyOAuthSidecar({
-								...readProxyOAuthSidecar(),
-								[provider]: credential,
-							}),
-					});
-					persistedUnderLock = true;
-				} else {
-					refreshed = await refreshCodex(entry);
-				}
+				refreshed = await refreshUnderLock(refreshCodex);
 			} else if (family === "cursor") {
 				refreshed = mergeRefreshedCredentials(
 					entry,
