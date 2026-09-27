@@ -430,10 +430,25 @@ function requirePiAiOauth(): PiAiOauthBridge {
  * pi-ai's static model catalog lookup. It lived on the package root until 0.79 and
  * moved to `dist/compat.js` in 0.80, so resolve it lazily from whichever is present
  * — and treat "absent" as "no canonical metadata", never as a load failure.
+ *
+ * Under Pi's extension loader, jiti's `require` resolves `@earendil-works/pi-ai` to the
+ * host's already-loaded compat entry, so prefer that: requiring this package's own copy
+ * loads its whole provider catalog again and cost every Pi startup about 0.15s. Plain Node
+ * ESM (the tests, other hosts) has no `require` and keeps the lookup below.
  */
 let piAiGetModelFn: ((provider: string, id: string) => any) | null | undefined;
 
+function hostPiAiGetModel(): ((provider: string, id: string) => any) | undefined {
+	try {
+		const candidate = typeof require === "function" ? require("@earendil-works/pi-ai")?.getModel : undefined;
+		return typeof candidate === "function" ? candidate : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 function piAiGetModel(provider: string, id: string): any {
+	if (piAiGetModelFn === undefined) piAiGetModelFn = hostPiAiGetModel();
 	if (piAiGetModelFn === undefined) {
 		piAiGetModelFn = null;
 		const root = findPiAiRoot();

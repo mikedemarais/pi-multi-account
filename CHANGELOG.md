@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pi starts about 0.15s faster. Numbered Claude and Kimi slots now read model metadata from the host's already-loaded pi-ai when Pi's extension loader provides it, instead of loading this package's own pi-ai and its whole provider catalog again. Other hosts keep the previous lookup.
+
 - Forced Anthropic and Codex OAuth refreshes (usage-poll 401s, auth-error recovery, slot proxy) now spend the one-use refresh token under Pi's cross-process `auth.json` lock. Pi 0.87 no longer exposes its AuthStorage to extensions, so the Codex lock added in 1.22.0 was silently skipped and Anthropic never had one; the extension now takes the same `proper-lockfile` lock Pi core uses. Previously every idle Pi window raced for the same token when the 8h Anthropic access token expired, which could burn the live credential and force a manual `/login` roughly once a day. A window that loses the race now adopts the rotated token instead of sending the spent one. The lock also refreshes its timestamp every 5 s so Pi's own synchronous lock path (10 s staleness) cannot break it mid-refresh. Pi windows started before this update keep refreshing without the lock until they are restarted.
 
 - The Anthropic OAuth billing header now reports the locally installed Claude Code (`claude --version`) when it is newer than `CLAUDE_CODE_VERSION`, so a pinned install keeps working when a new model requires a newer client (Opus 5.5 rejected 2.1.274). Set `PI_MULTI_ACCOUNT_DETECT_CLAUDE_CODE_VERSION=0` to use only the constant.
