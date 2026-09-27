@@ -26,7 +26,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createPayloadStream } from "./provider-payload-stream.ts";
-import { mutateProxyAuth } from "./auth-file-transaction.ts";
+import { lockedAuthFileStorage, mutateProxyAuth } from "./auth-file-transaction.ts";
 import { mergeStateDeltas, mutateStateFile } from "./state-file-transaction.ts";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -4863,16 +4863,18 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			return { status: "unsupported" };
 		}
 
-		const authStorage = ctx?.modelRegistry?.authStorage;
+		const hostAuthStorage = ctx?.modelRegistry?.authStorage;
 		// Test harnesses and future Pi versions can provide a first-class forced refresh operation.
-		if (typeof authStorage?.forceRefreshProvider === "function") {
-			return authStorage.forceRefreshProvider(provider);
+		if (typeof hostAuthStorage?.forceRefreshProvider === "function") {
+			return hostAuthStorage.forceRefreshProvider(provider);
 		}
 		// Refuse to refresh at all if the result has nowhere to go: the refresh itself
 		// revokes the token currently on disk.
-		if (!canPersistRefreshedCredentials(authStorage)) {
+		if (!canPersistRefreshedCredentials(hostAuthStorage)) {
 			return { status: "unsupported" };
 		}
+		// Pi >= 0.87 no longer exposes its AuthStorage to extensions; take its auth.json lock directly.
+		const authStorage = hostAuthStorage ?? lockedAuthFileStorage(AUTH_PATH);
 
 		const family = classifyProvider(provider, config.qwenProvider);
 		try {
@@ -4905,8 +4907,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			};
 			if (family === "anthropic") {
 				refreshed = await refreshUnderLock(
-					(current) =>
-						refreshAnthropicCredentials(current, undefined, provider) as Promise<AuthEntry>,
+					(current) => refreshAnthropicCredentials(current, undefined, provider),
 				);
 			} else if (family === "openai-codex") {
 				const refreshCodex = async (current: AuthEntry) => {

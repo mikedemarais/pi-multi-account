@@ -370,8 +370,10 @@ function setup(opts: {
 	 * and neither the `set()` this extension used to persist with nor a host-side
 	 * `forceRefreshProvider`. Every other test uses the convenience stub that provides
 	 * `forceRefreshProvider`, which short-circuits the extension's own refresh path.
+	 *
+	 * "pi-0.87" is the REAL surface of pi 0.87.x: `ctx.modelRegistry` exposes no AuthStorage.
 	 */
-	hostAuthStorage?: "pi-0.84";
+	hostAuthStorage?: "pi-0.84" | "pi-0.87";
 	/** Contend for the port the previous instance is still listening on, instead of a fresh one. */
 	reuseSlotProxyPort?: boolean;
 }) {
@@ -522,7 +524,9 @@ function setup(opts: {
 					);
 				}),
 			authStorage:
-				opts.hostAuthStorage === "pi-0.84"
+				opts.hostAuthStorage === "pi-0.87"
+					? undefined
+					: opts.hostAuthStorage === "pi-0.84"
 					? {
 							reload: () => {
 								rec.authReloads++;
@@ -9455,6 +9459,65 @@ test("two storage instances serialize Codex refresh and make one network exchang
 	}
 });
 
+test("the extension's auth.json lock and Pi's own AuthStorage exclude each other", async () => {
+	// Pi >= 0.87 hands extensions no AuthStorage, so the extension takes auth.json's lock itself.
+	// That only protects a one-use refresh token if Pi core's own refresh honours the same lock.
+	const { AuthStorage } = await import(new URL(
+		"../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js", import.meta.url).href);
+	const { lockedAuthFileStorage } = await import("../auth-file-transaction.ts");
+	const provider = "anthropic-account-2";
+	const oldCredential = { type: "oauth", access: "old-access", refresh: "old-refresh", expires: 1 };
+	for (const [holder, waiter] of [["pi", "extension"], ["extension", "pi"]]) {
+		const root = mkdtempSync(join(tmpdir(), "anthropic-refresh-lock-"));
+		const path = join(root, "auth.json");
+		writeFileSync(path, JSON.stringify({
+			[provider]: oldCredential,
+			unrelated: { type: "api_key", key: "keep" },
+		}));
+		let exchanges = 0;
+		let holderEntered!: () => void;
+		const entered = new Promise<void>((resolve) => { holderEntered = resolve; });
+		let releaseHolder!: () => void;
+		const gate = new Promise<void>((resolve) => { releaseHolder = resolve; });
+		const readLatest = () => JSON.parse(readFileSync(path, "utf8"))[provider];
+		const run = (kind: string) =>
+			refreshAndPersistWithStorageLock({
+				provider,
+				credentials: oldCredential,
+				authStorage: kind === "pi" ? AuthStorage.create(path) : lockedAuthFileStorage(path),
+				readLatest,
+				refresh: async (current: any) => {
+					exchanges++;
+					if (exchanges === 1) {
+						holderEntered();
+						await gate;
+					}
+					return { ...current, access: "new-access", refresh: "new-refresh", expires: Date.now() + 86_400_000 };
+				},
+			});
+
+		try {
+			const first = run(holder);
+			await entered;
+			const second = run(waiter);
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			assert.equal(exchanges, 1, `${waiter} must wait while ${holder} holds the lock`);
+			releaseHolder();
+			const [a, b] = await Promise.all([first, second]);
+
+			assert.equal(exchanges, 1, `${waiter} must adopt ${holder}'s token instead of spending the old one`);
+			assert.equal(a.refresh, "new-refresh");
+			assert.equal(b.refresh, "new-refresh");
+			const disk = JSON.parse(readFileSync(path, "utf8"));
+			assert.equal(disk[provider].refresh, "new-refresh");
+			assert.equal(disk.unrelated.key, "keep");
+		} finally {
+			releaseHolder();
+			rmSync(root, { recursive: true, force: true });
+		}
+	}
+});
+
 test("two OS processes serialize a shadowed Codex refresh through the production sidecar", async () => {
 	const root = mkdtempSync(join(tmpdir(), "codex-refresh-processes-"));
 	const authPath = join(root, "auth.json");
@@ -10309,6 +10372,42 @@ test("a forced Anthropic refresh spends the token once and persists the rotation
 			assert.equal(stored.type, "oauth");
 			assert.equal(stored.access, "a2-new");
 			assert.equal(stored.refresh, "a2-r2", "the rotated token must be persisted");
+		},
+	);
+});
+
+test("on pi 0.87, which exposes no AuthStorage, a forced Anthropic refresh still holds auth.json's lock", async () => {
+	const provider = "anthropic-account-2";
+	const lockHeldDuringExchange: boolean[] = [];
+	await withAnthropicTokenEndpoint(
+		() => {
+			lockHeldDuringExchange.push(existsSync(`${AUTH}.lock`));
+			return new Response(
+				JSON.stringify({ access_token: "a2-new", refresh_token: "a2-r2", expires_in: 28_800 }),
+				{ status: 200 },
+			);
+		},
+		async (tokenRequests) => {
+			const t = setup({
+				accounts: { [provider]: { type: "oauth", access: "a2-old", refresh: "a2-r1", expires: 1 } },
+				current: { provider, id: "claude-opus-4-8" },
+				config: { childProxy: false },
+				hostAuthStorage: "pi-0.87",
+			});
+			await t.fire("session_start");
+
+			await finishError(
+				t,
+				provider,
+				"claude-opus-4-8",
+				"Your authentication token has been invalidated. Please try signing in again.",
+			);
+
+			assert.deepEqual(tokenRequests, ["a2-r1"]);
+			assert.deepEqual(lockHeldDuringExchange, [true], "the one-use token must be spent under Pi's lock");
+			assert.equal(existsSync(`${AUTH}.lock`), false, "and the lock is released afterwards");
+			assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))[provider].refresh, "a2-r2");
+			assert.ok(!t.readState().invalidatedByProvider?.[provider]);
 		},
 	);
 });
