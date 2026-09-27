@@ -4874,7 +4874,12 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			return { status: "unsupported" };
 		}
 		// Pi >= 0.87 no longer exposes its AuthStorage to extensions; take its auth.json lock directly.
-		const authStorage = hostAuthStorage ?? lockedAuthFileStorage(AUTH_PATH);
+		const authStorage =
+			typeof hostAuthStorage?.modify === "function"
+				? hostAuthStorage
+				: lockedAuthFileStorage(AUTH_PATH, (error) =>
+						logEvent("auth_lock_compromised", { provider, error: error.message }),
+					);
 
 		const family = classifyProvider(provider, config.qwenProvider);
 		try {
@@ -4887,7 +4892,6 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			const refreshUnderLock = async (
 				refresh: (current: AuthEntry) => Promise<AuthEntry>,
 			): Promise<AuthEntry> => {
-				if (typeof authStorage?.modify !== "function") return refresh(entry);
 				const result = await refreshAndPersistWithStorageLock({
 					provider,
 					credentials: entry,

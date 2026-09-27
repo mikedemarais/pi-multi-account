@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mutateProxyAuth } from "../auth-file-transaction.ts";
+import { lockedAuthFileStorage, mutateProxyAuth } from "../auth-file-transaction.ts";
 import { applyRestoreAll, applyShadowAll, mergeParentAuth } from "../slot-proxy-auth.ts";
 
 const lockfile = createRequire(import.meta.url)("proper-lockfile");
@@ -54,4 +54,25 @@ test("Pi's auth lock blocks shadow mutation and the later transaction preserves 
     mutateProxyAuth(auth, sidecar, (a, s) => applyShadowAll([slot], a, s), "shadow");
     assert.equal(JSON.parse(readFileSync(auth, "utf8")).concurrent.key, "fixture-new");
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a refresh holding the auth lock past 10 s is not broken by Pi's sync lock path", async () => {
+  // Pi's AuthStorage constructor takes the lock with lockSync's default 10 s staleness. A holder
+  // that refreshes the lock's mtime only every 15 s would have it deleted mid-refresh. Wait 12 s:
+  // proper-lockfile may stamp a new lock's mtime up to 1 s ahead.
+  const root = mkdtempSync(join(tmpdir(), "auth-lock-stale-"));
+  const auth = join(root, "auth.json");
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    writeFileSync(auth, JSON.stringify({ [slot]: token }));
+    const holder = lockedAuthFileStorage(auth).modify(slot, async () => { await gate; return undefined; });
+    await new Promise((resolve) => setTimeout(resolve, 12_000));
+    assert.throws(() => lockfile.lockSync(auth, { realpath: false }), { code: "ELOCKED" });
+    release();
+    await holder;
+  } finally {
+    release();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

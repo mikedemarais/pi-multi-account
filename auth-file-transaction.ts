@@ -35,30 +35,46 @@ function ensureAuthFile(authPath: string): void {
 
 // Pi's FileAuthStorageBackend value: the lock's staleness and how long a waiter keeps trying.
 const AUTH_LOCK_STALE_MS = 30_000;
+// Pi's sync lock path (constructor reload) uses proper-lockfile's default 10 s staleness, so the
+// holder must refresh the lock's mtime well inside that, not at the default stale / 2 = 15 s.
+const AUTH_LOCK_UPDATE_MS = 5_000;
 
-/** Acquire auth.json's lock exactly as Pi's FileAuthStorageBackend does. */
-async function acquireAuthLock(authPath: string, signal?: AbortSignal): Promise<() => Promise<void>> {
+/** Acquire auth.json's lock with the path, staleness and retry deadline Pi's backend uses. */
+async function acquireAuthLock(
+  authPath: string,
+  signal: AbortSignal | undefined,
+  onCompromised: ((error: Error) => void) | undefined,
+): Promise<() => Promise<void>> {
   const lockfile = require("proper-lockfile") as {
     lock(path: string, options: object): Promise<() => Promise<void>>;
   };
   const deadline = Date.now() + AUTH_LOCK_STALE_MS;
   for (let retry = 0; ; retry++) {
     signal?.throwIfAborted();
+    let release: () => Promise<void>;
     try {
-      return await lockfile.lock(authPath, {
+      release = await lockfile.lock(authPath, {
         realpath: false,
         retries: 0,
         stale: AUTH_LOCK_STALE_MS,
-        // proper-lockfile's default throws from a timer, which would crash Pi. By the time a
-        // compromise matters the token has already rotated, so writing it beats dropping it.
-        onCompromised: () => {},
+        update: AUTH_LOCK_UPDATE_MS,
+        // proper-lockfile's default throws from a timer, which would crash Pi. A compromise can
+        // be noticed mid-exchange; modify() still writes the rotated token (re-reading the file
+        // first) because dropping it would lose the only live credential.
+        onCompromised: (error: Error) => onCompromised?.(error),
       });
     } catch (error: any) {
       const remainingMs = deadline - Date.now();
       if (error?.code !== "ELOCKED" || remainingMs <= 0) throw error;
       const baseDelayMs = Math.min(10 * 2 ** retry, 1_000);
       await sleep(Math.min(Math.round(baseDelayMs * (1 + Math.random())), remainingMs), undefined, { signal });
+      continue;
     }
+    if (signal?.aborted) {
+      await release().catch(() => {});
+      signal.throwIfAborted();
+    }
+    return release;
   }
 }
 
@@ -67,7 +83,7 @@ async function acquireAuthLock(authPath: string, signal?: AbortSignal): Promise<
  * read-modify-write Pi performs on auth.json, so an extension refresh and one in Pi core or
  * another Pi window never spend the same one-use refresh token at once.
  */
-export function lockedAuthFileStorage(authPath: string) {
+export function lockedAuthFileStorage(authPath: string, onCompromised?: (error: Error) => void) {
   return {
     async modify(
       provider: string,
@@ -75,7 +91,7 @@ export function lockedAuthFileStorage(authPath: string) {
       options?: { signal?: AbortSignal },
     ): Promise<AuthBlob | undefined> {
       ensureAuthFile(authPath);
-      const release = await acquireAuthLock(authPath, options?.signal);
+      const release = await acquireAuthLock(authPath, options?.signal, onCompromised);
       try {
         const current = read(authPath)[provider];
         const next = await fn(current);
@@ -99,9 +115,11 @@ export function mutateProxyAuth(
   write: (path: string, data: Auth) => void = atomicWrite,
 ): boolean {
   ensureAuthFile(authPath);
-  // Same package/options as Pi FileAuthStorageBackend. Never read a snapshot before locking.
+  // Same package and lock path as Pi FileAuthStorageBackend. Never read a snapshot before locking.
+  // Pi's async lock refreshes its mtime only every 15 s, so the default 10 s staleness would
+  // delete a live lock mid-refresh; use the async lock's 30 s instead.
   const lockfile = require("proper-lockfile") as { lockSync(path: string, options: object): () => void };
-  const release = lockfile.lockSync(authPath, { realpath: false });
+  const release = lockfile.lockSync(authPath, { realpath: false, stale: AUTH_LOCK_STALE_MS });
   try {
     const plan = transform(read(authPath), read(sidecarPath));
     if (!plan.changed) return false;
