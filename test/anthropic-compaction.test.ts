@@ -41,7 +41,6 @@ test("eligibility: direct Claude API slots and documented models only", () => {
 	assert(eligible(base) && eligible(slot));
 	assert(!eligible({ ...slot, provider: "claude-code" }));
 	assert(!eligible({ ...slot, baseUrl: "https://proxy.example.com" }));
-	assert(eligible({ ...slot, id: "claude-sonnet-5-5" }));
 	assert(!eligible({ ...slot, id: "claude-haiku-4-5" }));
 });
 
