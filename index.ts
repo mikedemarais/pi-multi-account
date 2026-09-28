@@ -2779,9 +2779,12 @@ const FABLE_MODEL_DEFS: Record<string, Record<string, unknown>> = {
 	},
 };
 
-function anthropicModelDef(id: string, providerId: string) {
+function anthropicModelDef(id: string, providerId: string, hostModel?: any) {
 	const canonical = piAiGetModel("anthropic", id) as any;
 	if (canonical) return { ...canonical, provider: providerId };
+	// A model only Pi's registry knows (its remote catalog, e.g. claude-sonnet-5-5 before pi-ai
+	// ships it) keeps the host's metadata instead of the 200K/32K placeholder below.
+	if (hostModel?.id === id && hostModel.api === "anthropic-messages") return { ...hostModel, provider: providerId };
 	const fable = FABLE_MODEL_DEFS[id];
 	if (fable) {
 		// This definition is used only after the host catalog has named the model. It supplies exact
@@ -2999,9 +3002,10 @@ function registerAnthropicSlot(
 	id: string,
 	modelIds: string[] = DEFAULT_ANTHROPIC_MODELS,
 	baseUrl = "https://api.anthropic.com",
+	hostModels?: ReadonlyMap<string, any>,
 ) {
 	if (id === ANTHROPIC_BASE) return; // base provider: oauth + shaping registered in piMultiAccount()
-	const models = modelIds.map((m) => anthropicModelDef(m, id));
+	const models = modelIds.map((m) => anthropicModelDef(m, id, hostModels?.get(m)));
 	pi.registerProvider(id, {
 		name: `Claude Pro/Max (${id})`,
 		baseUrl,
@@ -5081,16 +5085,15 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	 * silently broke the project's hard rule of always staying on a provider's top model.
 	 */
 	function refreshRegistryAnthropicModels(ctx: any) {
-		let hostIds: string[] = [];
+		const hostModels = new Map<string, any>();
 		try {
-			hostIds =
-				ctx?.modelRegistry
-					?.getAll?.()
-					?.filter((model: any) => model?.provider === ANTHROPIC_BASE)
-					?.map((model: any) => model?.id) ?? [];
+			for (const model of ctx?.modelRegistry?.getAll?.() ?? []) {
+				if (model?.provider === ANTHROPIC_BASE && typeof model.id === "string") hostModels.set(model.id, model);
+			}
 		} catch {
-			hostIds = [];
+			hostModels.clear();
 		}
+		const hostIds = [...hostModels.keys()];
 		const ranked = rankAnthropicModelIds([
 			...hostIds,
 			...DEFAULT_ANTHROPIC_MODELS,
@@ -5107,6 +5110,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 				provider,
 				ranked,
 				numberedSlotBaseUrl(provider, "anthropic"),
+				hostModels,
 			);
 		}
 	}

@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Numbered Claude slots keep Pi's registry metadata for a model only Pi's remote catalog knows, such as `claude-sonnet-5-5` before pi-ai ships it. Re-registering the slots at session start previously replaced it with a 200K-context, 32K-output placeholder with no thinking levels or compat flags.
+
 - Pi starts about 0.13s faster. Numbered Claude and Kimi slots now read model metadata from the host's already-loaded pi-ai when Pi's extension loader provides it, instead of loading this package's own pi-ai and its whole provider catalog again. Other hosts keep the previous lookup.
 
 - Forced Anthropic and Codex OAuth refreshes (usage-poll 401s, auth-error recovery, slot proxy) now spend the one-use refresh token under Pi's cross-process `auth.json` lock. Pi 0.87 no longer exposes its AuthStorage to extensions, so the Codex lock added in 1.22.0 was silently skipped and Anthropic never had one; the extension now takes the same `proper-lockfile` lock Pi core uses. Previously every idle Pi window raced for the same token when the 8h Anthropic access token expired, which could burn the live credential and force a manual `/login` roughly once a day. A window that loses the race now adopts the rotated token instead of sending the spent one. The lock also refreshes its timestamp every 5 s so Pi's own synchronous lock path (10 s staleness) cannot break it mid-refresh. Pi windows started before this update keep refreshing without the lock until they are restarted.

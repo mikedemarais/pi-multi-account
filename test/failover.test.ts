@@ -343,6 +343,8 @@ function setup(opts: {
 	hostCodexModels?: string[];
 	/** Optional exact host catalog by provider, used for cross-family/apex routing tests. */
 	hostModelsByProvider?: Record<string, string[]>;
+	/** Full metadata for host registry models, keyed "provider/id"; others are bare { provider, id }. */
+	hostModelMetadata?: Record<string, Record<string, unknown>>;
 	/** Providers whose auth is supplied by an extension rather than auth.json. */
 	ambientAuthProviders?: string[];
 	/** Accounts Pi does NOT know any model for — logged in, but unusable until configured. */
@@ -427,7 +429,7 @@ function setup(opts: {
 	);
 	const registeredModels = new Map<string, any[]>();
 	const providerConfigs = new Map<string, any>();
-	const mkModel = (provider: string, id: string) => ({ provider, id });
+	const mkModel = (provider: string, id: string) => ({ ...opts.hostModelMetadata?.[`${provider}/${id}`], provider, id });
 	const rec = {
 		sent: [] as Array<{ prompt: string; options?: Record<string, unknown> }>,
 		continueCalls: [] as Array<{ options?: Record<string, unknown> }>,
@@ -7116,6 +7118,34 @@ test("numbered Anthropic slots inherit native Fable metadata from the host catal
 	assert.equal(fable?.contextWindow, 1_000_000);
 	assert.equal(fable?.maxTokens, 128_000);
 	assert.deepEqual(fable?.thinkingLevelMap, { off: null, xhigh: "xhigh", max: "max" });
+	await t.fire("session_shutdown");
+});
+
+test("numbered Anthropic slots keep host registry metadata for a model pi-ai does not ship", async () => {
+	// Pi's remote catalog knew claude-sonnet-5-5 before pi-ai's static catalog did.
+	const sonnet = {
+		name: "Claude Sonnet 5.5", api: "anthropic-messages", baseUrl: "https://api.anthropic.com", reasoning: true,
+		input: ["text", "image"], contextWindow: 1_000_000, maxTokens: 128_000,
+		cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+		compat: { forceAdaptiveThinking: true, supportsTemperature: false },
+	};
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a1", refresh: "ar1" },
+			"anthropic-account-2": { type: "oauth", access: "a2", refresh: "ar2" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-5" },
+		hostModelsByProvider: { anthropic: ["claude-sonnet-5-5", "claude-opus-5"] },
+		hostModelMetadata: { "anthropic/claude-sonnet-5-5": sonnet },
+	});
+	await t.fire("session_start");
+	const slot = t.ctx.modelRegistry.find("anthropic-account-2", "claude-sonnet-5-5");
+	assert.equal(slot?.provider, "anthropic-account-2");
+	assert.equal(slot?.name, "Claude Sonnet 5.5");
+	assert.equal(slot?.contextWindow, 1_000_000);
+	assert.equal(slot?.maxTokens, 128_000);
+	assert.deepEqual(slot?.cost, sonnet.cost);
+	assert.deepEqual(slot?.compat, sonnet.compat);
 	await t.fire("session_shutdown");
 });
 
