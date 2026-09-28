@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Claude Sonnet 5.5 (`claude-sonnet-5-5`): Anthropic documents it for on-demand compaction, so native compaction now covers it. The OAuth billing header floor (`CLAUDE_CODE_VERSION`) is now 2.1.284, the first Claude Code release that serves Sonnet 5.5.
+
 - Optional Anthropic native compaction (`anthropicNativeCompaction: true`, adapted from pi-anthropic-compat). On direct Claude API slots with a documented model, compaction asks Anthropic for a signed summary (`compact-2026-09-04`); its plain text becomes the entry summary, so other models and accounts keep reading ordinary text, and later requests from the same slot and model replay the signed block ahead of subscription shaping. It runs under the same conditions as the Codex delegate (automatic failover on, provider not exempt). Any failure warns with a fixed reason and continues with the existing compaction path; a failed module load disables the feature instead of affecting requests. Off by default.
 
 ### Fixed
