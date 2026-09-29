@@ -2782,9 +2782,6 @@ const FABLE_MODEL_DEFS: Record<string, Record<string, unknown>> = {
 function anthropicModelDef(id: string, providerId: string, hostModel?: any) {
 	const canonical = piAiGetModel("anthropic", id) as any;
 	if (canonical) return { ...canonical, provider: providerId };
-	// A model only Pi's registry knows (its remote catalog, e.g. claude-sonnet-5-5 before pi-ai
-	// ships it) keeps the host's metadata instead of the 200K/32K placeholder below.
-	if (hostModel?.api === "anthropic-messages") return { ...hostModel, provider: providerId };
 	const fable = FABLE_MODEL_DEFS[id];
 	if (fable) {
 		// This definition is used only after the host catalog has named the model. It supplies exact
@@ -2803,6 +2800,9 @@ function anthropicModelDef(id: string, providerId: string, hostModel?: any) {
 			...fable,
 		};
 	}
+	// A model only Pi's registry knows (its remote catalog, e.g. claude-sonnet-5-5 before pi-ai
+	// ships it) keeps the host's metadata instead of the 200K/32K placeholder.
+	if (hostModel?.api === "anthropic-messages") return { ...hostModel, provider: providerId };
 	return {
 		id,
 		name: id,

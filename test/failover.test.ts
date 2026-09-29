@@ -7122,9 +7122,10 @@ test("numbered Anthropic slots inherit native Fable metadata from the host catal
 });
 
 test("numbered Anthropic slots keep host registry metadata for a model pi-ai does not ship", async () => {
-	// Pi's remote catalog knew claude-sonnet-5-5 before pi-ai's static catalog did.
+	// Only Pi's remote catalog knows this model (as with claude-sonnet-5-5 before pi-ai shipped it).
+	// A made-up id keeps the test valid after pi-ai's static catalog catches up.
 	const sonnet = {
-		name: "Claude Sonnet 5.5", api: "anthropic-messages", baseUrl: "https://api.anthropic.com", reasoning: true,
+		name: "Claude Sonnet 9.9", api: "anthropic-messages", baseUrl: "https://api.anthropic.com", reasoning: true,
 		input: ["text", "image"], contextWindow: 1_000_000, maxTokens: 128_000,
 		cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
 		compat: { forceAdaptiveThinking: true, supportsTemperature: false },
@@ -7135,13 +7136,13 @@ test("numbered Anthropic slots keep host registry metadata for a model pi-ai doe
 			"anthropic-account-2": { type: "oauth", access: "a2", refresh: "ar2" },
 		},
 		current: { provider: "anthropic", id: "claude-opus-5" },
-		hostModelsByProvider: { anthropic: ["claude-sonnet-5-5", "claude-opus-5"] },
-		hostModelMetadata: { "anthropic/claude-sonnet-5-5": sonnet },
+		hostModelsByProvider: { anthropic: ["claude-sonnet-9-9", "claude-opus-5"] },
+		hostModelMetadata: { "anthropic/claude-sonnet-9-9": sonnet },
 	});
 	await t.fire("session_start");
-	const slot = t.ctx.modelRegistry.find("anthropic-account-2", "claude-sonnet-5-5");
+	const slot = t.ctx.modelRegistry.find("anthropic-account-2", "claude-sonnet-9-9");
 	assert.equal(slot?.provider, "anthropic-account-2");
-	assert.equal(slot?.name, "Claude Sonnet 5.5");
+	assert.equal(slot?.name, "Claude Sonnet 9.9");
 	assert.equal(slot?.contextWindow, 1_000_000);
 	assert.equal(slot?.maxTokens, 128_000);
 	assert.deepEqual(slot?.cost, sonnet.cost);
