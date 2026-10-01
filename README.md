@@ -11,9 +11,9 @@ When the account you are using hits a quota or rate limit, `pi-multi-account` tr
 - **Auto-discovers new Codex models per account.** At session start (and on `reload` / `rediscover`) it reads OpenAI's authenticated model catalog, mirrors each account's actually available models onto its Pi alias, and follows OpenAI's server priority. A new flagship can therefore win immediately without an extension release or a hard-coded model id.
 - **Handles auth failures without poisoning healthy OAuth accounts.** A generic final 401 briefly cools down a refreshable account and moves the current task forward. Explicit provider verdicts such as `authentication token has been invalidated` force an early refresh; if the refresh token is dead too, the slot is removed and Pi prints the interactive `/login` recovery steps.
 - **Fails over on quota / rate-limit** (429 / 402 / 403 and friends): the exhausted account goes on cooldown (parsed from the provider's own reset metadata when available) and Pi first tries another account with the same model. If it must leave the family, it preserves the model's quality band — Sol/Opus/other frontier flagships stay frontier; Terra/Sonnet stay balanced; Luna/Haiku stay fast — and keeps the session's thinking level. A fresh provider verdict of `blocked` or 100% is skipped automatically instead of wasting the turn; manual `next` remains an explicit one-attempt override for stale telemetry.
-- **Optional auto-continue**: resumes the interrupted turn after a switch from the last safe point. Temporary 5xx/overload errors and Cursor stalls retry the exact selected provider/account/model, without marking its quota exhausted. After four failed attempts (or an earlier recovery breaker), automatic retries stop with an explicit explanation; temporary errors never authorize a switch. Same-route retries are labelled as retries, not fake switches. A failed or cancelled automatic compaction still continues the task instead of leaving the session parked in Working.
+- **Optional immediate auto-continue**: resumes the interrupted turn after a switch from the last safe point. A continuation that exhausts its newly selected account keeps advancing instead of stopping after the first hop. Temporary 5xx/overload errors and Cursor stalls retry the exact selected provider/account/model, without marking its quota exhausted. After four failed attempts (or an earlier recovery breaker), automatic retries stop with an explicit explanation; temporary errors never authorize a switch. Same-route retries are labelled as retries, not fake switches. A rejected Pi follow-up remains armed instead of losing the task. A failed or cancelled automatic compaction still continues the task instead of leaving the session parked in Working.
 - **Never hides a fresh user message in a private cooldown queue.** If no account is ready, the message remains in Pi's visible transcript and Pi owns its normal delivery/retry path.
-- **Session-bound overnight resume**: if every account is cooling down, the live Pi session waits for the earliest recovery and continues automatically. A new user message, `/multi-account stop`, session exit, or Esc during a running turn cancels the chain.
+- **Session-bound overnight resume, independently configurable**: if every compatible account is cooling down, the live Pi session keeps the task armed by default even when ordinary post-switch `autoContinue` is off. It polls every account (quota monitoring remains active when the footer is hidden), reacts to fresh provider recovery evidence, and continues on the first genuinely usable route. A new user message, `/multi-account stop`, session exit, or Esc during a running turn cancels the chain.
 - **Deduplicates provably identical accounts** so duplicate Codex workspace memberships and identical credentials do not consume multiple rotation slots or get separate cooldowns. Different users in one Team/Business workspace remain distinct. New provable duplicate logins are rejected before the redundant slot is saved.
 - **Keeps YOUR reasoning level across automatic switches.** Whatever the session runs at — your Pi default, `/thinking`, or a per-agent `--thinking low` — is preserved and restored after every account/model switch, so it never drifts downward when a weaker fallback model clamps it. Manual `/model` selections adopt Pi's per-model thinking default in `auto` mode; an explicit CLI `--thinking` or forced `reasoningLevel` remains authoritative. The extension does not otherwise override your level, and extreme levels such as `xhigh` / Max / Ultra are never forced.
 - **Shows live limits for the active account** in Pi's footer: remaining 5-hour/session and weekly allowance plus reset countdowns for Codex, Anthropic, and Ollama Cloud accounts, SuperGrok / xAI subscription credit usage for `/login xai` OAuth (not Cursor Grok, not `XAI_API_KEY`), and GLM Coding Plan CN 5-hour/weekly credit quota for `zai-coding-cn`. GLM CN uses the raw Coding Plan API key only at `https://open.bigmodel.cn/api/monitor/usage/quota/limit`; global `zai` keys are not sent there. Missing or malformed quota is unknown, never assumed unused.
@@ -26,11 +26,18 @@ pi install npm:pi-multi-account
 
 Restart Pi or run `/reload` after installation.
 
-Requires Node 22+ and `@earendil-works/pi-ai` 0.78 or newer — it is installed automatically as a
-dependency. Both the pre-0.80 OAuth API and the 0.80+ provider-factory API are supported, so the
-extension keeps working across pi-ai upgrades. If a pi-ai it cannot adapt is ever encountered, the
-extension still loads and API-key accounts keep rotating; only subscription login is unavailable,
-and it says so at session start.
+Requires Node 22+ and Agent Pi / pi-ai **>=0.85.1, <0.88.0** (CI covers 0.85.1, 0.86.1 and 0.87.1).
+Pi's host package is a peer. `pi-ai` is a runtime dependency for the OAuth/catalog bridge:
+Pi-managed installs intentionally do not install extension peer dependencies, but subscription
+login must be able to locate pi-ai on disk. Provider transports still use Pi's **host-bound**
+imports, not that filesystem-resolved bridge copy, so a stale nested pi-ai cannot remove tools or
+system instructions. Standalone SDK callers must pair their context with the installed pi-ai
+version. If the OAuth bridge is unavailable, API-key account discovery still works.
+
+Kimi OAuth spares remain available in `/login`, but are not written to `models.json`: without a
+Kimi child OAuth proxy those aliases would be resolvable but unauthenticated. Only real API-key
+Kimi slots are published for extension-free children. Existing user entries are not deleted;
+a previously generated unused Kimi alias can be removed from `models.json` and will not reappear.
 
 > **Anthropic (Claude Pro/Max) works out of the box.** OAuth login and request
 > shaping for the base `anthropic` provider and every `anthropic-account-*` alias
@@ -98,7 +105,9 @@ All three names are aliases for the same command: `/multi-account`, `/provider-f
 | `add [anthropic\|codex\|kimi\|cursor\|ollama\|qwen]` | Print the next free account slot to select from the interactive `/login` picker. Subscription families (Anthropic, Codex, Kimi, Cursor) are logged in through `/login`; API-key families are filled in `auth.json`. |
 | `remove [anthropic\|codex\|kimi\|cursor\|ollama\|qwen\|<provider-id>]` | Remove an account from `auth.json` and rotation. Family name drops the highest numbered alias slot; a full provider id removes that exact slot. Aliases: `rm`, `delete`. |
 | `next` | Manually switch to the next compatible-quality fallback, deliberately overriding recorded cooldowns for one attempt. Use explicit `switch` to select a different tier. |
-| `only-active [on\|off]` | Legacy picker preference; the complete Pi model registry remains available to all clients. Pi currently has no separate picker-only filter. Alias: `focus`. |
+| `pick` | Open a model picker for the current account only. Uses native model selection and its thinking default; never removes models from the shared registry. Requires an idle interactive session. Built-in `/model` remains unchanged. |
+| `save-default` | Save the current model and effective thinking level together as global startup defaults for new sessions. Preserves other models' thinking preferences. Project overrides, explicit CLI options, and resumed-session settings still take precedence. Automatic rotation never invokes this. |
+| `only-active [on\|off]` | Legacy picker preference; use `pick` for a current-account-only menu. The complete Pi model registry remains available to all clients. Alias: `focus`. |
 | `stop` | Abort and cancel automatic failover/resume for the current task. |
 | `reset` | Clear all cooldowns, invalidations and any pending auto-resume. |
 | `reload` | Reload config from disk and re-discover accounts. |
@@ -125,7 +134,8 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 | Key | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Master switch. |
-| `autoContinue` | `true` | Queue a continuation prompt after a switch. |
+| `autoContinue` | `true` | Immediately continue after a successful account/model switch or same-route temporary retry. This does not control the all-accounts-limited wait. |
+| `resumeAfterAllAccountsRecover` | `true` | When a real quota/rate limit leaves every compatible account cooling, keep the interrupted task armed in the current live session and resume on the first account that becomes genuinely usable. Independent of `autoContinue`; set `false` to opt out. |
 | `autoDiscover` | `true` | Auto-discover accounts from `auth.json`. |
 | `autoDiscoverModels` | `true` | Fetch OpenAI's authenticated model catalog for every Codex account and register new models on that account's alias automatically. |
 | `includeQwen` | `true` | Include Qwen / Alibaba accounts. |
@@ -159,7 +169,7 @@ State (cooldowns, invalidations, recent switches, credential-free Codex model ca
 
 ### Session model ownership
 
-Requires Agent Pi **0.85.1 or newer**. Pi's session branch and explicit SDK/CLI launch model are authoritative. Shared account telemetry and legacy `lastUserModel` / `lastUserThinkingLevel` state cannot replace another pane's live selection, and shutdown does not publish that selection as a global default. Cold-catalog repair uses this session's model history once at startup. Configure Pi's saved default explicitly for new sessions.
+Requires the supported Agent Pi versions listed above. Pi's session branch and explicit SDK/CLI launch model are authoritative. Shared account telemetry and legacy `lastUserModel` / `lastUserThinkingLevel` state cannot replace another pane's live selection, and shutdown does not publish that selection as a global default. Cold-catalog repair uses this session's model history once at startup. Configure Pi's saved default explicitly for new sessions.
 
 ### Host-owned background completions
 
@@ -169,7 +179,21 @@ Background attempts share the same cooldown and invalidation state as foreground
 
 ### pi-subagents and delegation-broker compatibility
 
-`pi-subagents` marks native child processes with `PI_SUBAGENT_CHILD=1` and owns their explicit model plus `fallbackModels` chain. Concurrent in-process SDK sessions also stay passive while a root session activation is live. The root lease is released at session shutdown, so `/reload`, `/new` and replacement root sessions do not permanently lose routing ownership. This is process-local ownership, not detection based on model names or a permanent first-factory flag. In those children this extension stays loaded only for provider/account registration, OAuth request shaping, and catalog support. It deliberately does **not** restore the interactive process's remembered model, persist the child's model as a user preference, switch models, queue work, or auto-continue after errors. The original provider error is returned unchanged so the parent runner can advance its verified fallback chain without a second router competing for model identity.
+`pi-subagents` marks native child processes with `PI_SUBAGENT_CHILD=1` and owns their explicit model plus `fallbackModels` chain. Under terminal Pi, a distinct concurrent in-process child also stays passive while a root activation is live. A replacement with the **same nonempty session ID** reacquires that root's failover ownership without closing its child proxy. The root lease is released at final session shutdown, so `/reload` and `/new` do not permanently lose routing ownership. In passive children this extension stays loaded only for provider/account registration, OAuth request shaping, and catalog support. It deliberately does **not** restore the interactive process's remembered model, persist the child's model as a user preference, switch models, queue work, or auto-continue after errors. The original provider error is returned unchanged so the parent runner can advance its verified fallback chain without a second router competing for model identity.
+
+### Multi-session hosts (pi-web and other in-process SDK hosts)
+
+Some hosts run many independent sessions in a single long-lived process — pi-web's session daemon, or in-process SDK hosts such as Enso (one session per chat thread). Terminal Pi's in-process root-activation lease would incorrectly demote every session but the first to passive in those hosts.
+
+- Under pi-web (`PI_WEB_SESSION=1`, set by the daemon itself) every session activates as an independent root automatically.
+- Any other multi-session host opts in by exporting `PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS=1` in the host process. Set this only when each session truly owns its model; sessions that share one model identity must keep the default single-root behavior.
+- Genuine `pi-subagents` children are unaffected either way: they run in a runner process marked `PI_SUBAGENT_CHILD=1`, which always takes precedence and stays passive.
+
+Hosts should not set `PI_WEB_SESSION` themselves — other extensions read it to detect pi-web specifically.
+
+In one process, independent roots share one canonical loopback proxy and its child-facing auth/models publication while any root has the child proxy enabled. Closing one root cannot expose its sibling's real OAuth or remove the route its bare children use; the final live root closes the listener and restores the original auth. A rehydrated session with the same ID replaces the old instance's failover ownership rather than counting as a second root. Another process holding the canonical port remains the publisher; a foreign listener is never allowed to overwrite its shared files.
+
+Roots with `childProxy: false` still participate in the shared lifetime if another root publishes placeholders. Any public numbered alias they registered earlier is moved to loopback **before** the placeholder appears; they keep the canonical listener alive if the publisher exits first, and only the final root restores auth. With no other publishing root, disabling `childProxy` retains the usual direct route. Hosts should still keep one consistent setting across concurrent roots.
 
 [`pi-delegation-broker`](https://github.com/Sarrius/pi-delegation-broker) is an optional companion for splitting work among isolated child agents, with task budgets, reports and verification. Each extension works independently and depends on Agent Pi, not on the other extension. Together, Multi Account manages your interactive account rotation while the broker delegates through Pi's registered providers and models. Neither installs or initializes the other.
 
@@ -186,6 +210,24 @@ A failover is only useful if the agent actually keeps working afterward. These g
 ## Privacy & security
 
 `pi-multi-account` reads credentials through Pi and its account store. Account removal, OAuth refresh and parent-owned proxy publication can update the credential files under Pi-compatible locks. Proxy publication keeps a private recovery copy before replacing a credential with a loopback placeholder, and restores the real credential before deleting that copy. Credentials are never stored in rotation state. Account/token values are reduced to a short irreversible SHA-256 fingerprint for re-login detection and deduplication. Credentials are sent only to their own provider endpoints: usage/account probes (`chatgpt.com/backend-api/wham/usage`, `api.anthropic.com/api/oauth/usage`, `cli-chat-proxy.grok.com/v1/billing`, `open.bigmodel.cn/api/monitor/usage/quota/limit` (CN Coding Plan keys only), Ollama Cloud's `/api/me` and `/api/usage`, or Ollama's loopback-only `http://127.0.0.1:11434/api/me` fallback), OpenAI's authenticated `chatgpt.com/backend-api/codex/models` catalog, and provider OAuth token endpoints when Pi's authentication implementation refreshes a login (for xAI, `auth.x.ai/oauth2/token`). Cached state contains percentages, reset times, plan/credit metadata, model metadata, provider-reported account email/alias, and the fingerprint, never the token. Config, state, and the debug log are written with `0600` permissions. The debug log records only provider/model ids, decisions, and truncated reasons — token-shaped material is redacted defensively — Review logs for private project details before sharing an issue. Disable it with `"debugLog": false` or `/multi-account log off`.
+
+## Compatibility validation
+
+`npm run release:check` runs TypeScript, the full suite, and package/privacy checks. CI also runs
+the suite on the supported newer Pi versions. Host-binding tests load the real extension wrapper
+through Pi with a deliberately incompatible nested pi-ai, inspect native request bodies, and
+complete a streamed tool-call/result cycle without real credentials or provider traffic.
+
+The optional companion Goal integration is selected explicitly; it never assumes a personal path:
+
+```bash
+PI_GOAL_TEST_ENTRY=/path/to/pi-goal/dist/index.ts node --test test/goal-quota-recovery.integration.test.ts
+PI_GOAL_TEST_ENTRY=/path/to/pi-goal/dist/index.ts PI_GOAL_EXHAUST_ALL=1 node --test test/goal-quota-recovery.integration.test.ts
+PI_GOAL_TEST_ENTRY=/path/to/pi-goal/dist/index.ts PI_GOAL_EXHAUST_ALL=1 PI_GOAL_RECOVER_ALL=1 node --test test/goal-quota-recovery.integration.test.ts
+```
+
+These exercise successful multi-hop continuation, quiet all-account waiting with explicit pause,
+and resumption after quota recovery. The test is explicitly skipped when no companion path is supplied.
 
 ## License
 

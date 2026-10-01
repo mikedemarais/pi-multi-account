@@ -36,6 +36,37 @@ test("Anthropic payload wrapper preserves tools declared by a Pi transcript", as
 	assert.deepEqual(request.tools?.map((tool: any) => tool.name), ["read"]);
 });
 
+test("lazy transport setup rejection reaches both stream consumers", async () => {
+	const wrapped = createPayloadStream(payload => payload, async () => { throw new Error("fixture setup failure"); });
+	const stream = wrapped({ api: "fixture" }, { messages: [] });
+	await assert.rejects(stream.result(), /fixture setup failure/);
+	await assert.rejects(async () => { for await (const _event of stream) { assert.fail("no events after setup failure"); } }, /fixture setup failure/);
+});
+
+test("cancellation during lazy initialization reaches one shared native stream", async () => {
+	const controller = new AbortController();
+	let release!: () => void;
+	const ready = new Promise<void>(resolve => { release = resolve; });
+	let starts = 0;
+	const result = { stopReason: "aborted" };
+	const wrapped = createPayloadStream(payload => payload, async () => {
+		await ready;
+		return { streamSimple: (_model, _context, options) => {
+			starts++;
+			assert.equal(options.signal, controller.signal);
+			assert.equal(options.signal.aborted, true);
+			return { async *[Symbol.asyncIterator]() { yield { type: "error", reason: "aborted", error: result }; }, async result() { return result; } };
+		} };
+	});
+	const stream = wrapped({ api: "fixture" }, { messages: [] }, { signal: controller.signal });
+	controller.abort(); release();
+	const events: any[] = [];
+	for await (const event of stream) events.push(event);
+	assert.equal(await stream.result(), result);
+	assert.equal(events[0].reason, "aborted");
+	assert.equal(starts, 1);
+});
+
 test("Cursor public provider stream keeps independent sessions isolated without host events", async () => {
 	const bodies: any[] = [];
 	for (const sessionId of ["child-one", "child-two"]) {

@@ -339,6 +339,8 @@ function setup(opts: {
 	continueBlocks?: () => Promise<void>;
 	omitContinueAgent?: boolean;
 	omitSendUserMessage?: boolean;
+	/** Reject this many prompt-injection attempts before accepting one. */
+	sendUserMessageRejects?: number;
 	/** Models the HOST (Pi) itself publishes for the base Codex provider. */
 	hostCodexModels?: string[];
 	/** Optional exact host catalog by provider, used for cross-family/apex routing tests. */
@@ -363,6 +365,10 @@ function setup(opts: {
 	settings?: { defaultProvider: string; defaultModel: string };
 	/** Simulate a child process launched by pi-subagents. */
 	subagentChild?: boolean;
+	/** Simulate pi-web's session daemon, which hosts many independent root sessions in one process. */
+	piWebHost?: boolean;
+	/** Simulate any other multi-session SDK host opting in via the host-neutral switch. */
+	independentRoots?: boolean;
 	/** Simulate Pi CLI arguments before the extension is loaded. */
 	cliArgs?: string[];
 	/**
@@ -440,7 +446,11 @@ function setup(opts: {
 		customMessages: [] as Array<{ message: any; options?: any }>,
 		compactionAuthFor: [] as string[],
 		thinkingLevels: [] as string[],
-		registrations: [] as Array<{ provider: string; models: number | undefined }>,
+		registrations: [] as Array<{
+			provider: string;
+			models: number | undefined;
+			baseUrl: string | undefined;
+		}>,
 		catalogSnapshots: [] as any[],
 		completionRouters: [] as Array<{
 			select: (request: any) => any;
@@ -616,6 +626,7 @@ function setup(opts: {
 		return delivery;
 	};
 
+	let sendUserMessageRejects = opts.sendUserMessageRejects ?? 0;
 	const pi: any = {
 		getActiveTools: () => ["lookup"],
 		getAllTools: () => [{ name: "lookup", description: "Synthetic", parameters: { type: "object", properties: {} } }],
@@ -630,12 +641,16 @@ function setup(opts: {
 				for (const handler of busEvents.get(name) ?? []) handler(payload);
 			},
 		},
-		registerProvider: (name: string, providerConfig?: { models?: any[] }) => {
+		registerProvider: (
+			name: string,
+			providerConfig?: { models?: any[]; baseUrl?: string },
+		) => {
 			known.add(name);
 			providerConfigs.set(name, providerConfig);
 			rec.registrations.push({
 				provider: name,
 				models: providerConfig?.models?.length,
+				baseUrl: providerConfig?.baseUrl,
 			});
 			if (providerConfig?.models) {
 				registeredModels.set(
@@ -685,8 +700,13 @@ function setup(opts: {
 				await handler({ model: ctx.model, previousModel, source: "set" }, ctx);
 			return true;
 		},
-		sendUserMessage: (prompt: string, options?: Record<string, unknown>) =>
-			rec.sent.push({ prompt, options }),
+		sendUserMessage: async (prompt: string, options?: Record<string, unknown>) => {
+			rec.sent.push({ prompt, options });
+			if (sendUserMessageRejects > 0) {
+				sendUserMessageRejects--;
+				throw new Error("Agent is already processing");
+			}
+		},
 		sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
 			rec.customMessages.push({ message, options });
 			return Promise.resolve();
@@ -724,9 +744,17 @@ function setup(opts: {
 	(pi as any).__testCompactFn = opts.compactFn;
 
 	const previousSubagentChild = process.env.PI_SUBAGENT_CHILD;
+	const previousPiWebHost = process.env.PI_WEB_SESSION;
+	const previousIndependentRoots = process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS;
 	const previousArgv = process.argv;
 	if (opts.subagentChild) process.env.PI_SUBAGENT_CHILD = "1";
 	else delete process.env.PI_SUBAGENT_CHILD;
+	// Tests run inside whatever process launched the test runner — which may itself be a
+	// pi-web session — so the host markers must be scrubbed unless the test opts in.
+	if (opts.piWebHost) process.env.PI_WEB_SESSION = "1";
+	else delete process.env.PI_WEB_SESSION;
+	if (opts.independentRoots) process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS = "1";
+	else delete process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS;
 	process.argv = ["node", "pi", ...(opts.cliArgs ?? [])];
 	try {
 		piMultiAccount(pi, { codexCompaction: opts.codexCompaction, anthropicNativeCompaction: opts.anthropicNativeCompaction });
@@ -734,6 +762,10 @@ function setup(opts: {
 		process.argv = previousArgv;
 		if (previousSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
 		else process.env.PI_SUBAGENT_CHILD = previousSubagentChild;
+		if (previousPiWebHost === undefined) delete process.env.PI_WEB_SESSION;
+		else process.env.PI_WEB_SESSION = previousPiWebHost;
+		if (previousIndependentRoots === undefined) delete process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS;
+		else process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS = previousIndependentRoots;
 	}
 
 	const fire = async (event: string, payload: any = {}) => {
@@ -836,6 +868,90 @@ function setup(opts: {
 		hasHandler: (event: string) => (events[event]?.length ?? 0) > 0,
 	};
 }
+
+test("account picker filters only its UI and uses the model's native thinking default", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, modelSetThinkingLevel: "low", thinkingLevel: "high" });
+	t.ctx.hasUI = true;
+	t.ctx.modelRegistry.getAvailable = () => t.ctx.modelRegistry.getAll();
+	const before = t.ctx.modelRegistry.getAvailable().map((m: any) => `${m.provider}/${m.id}`);
+	const provider = t.ctx.model.provider;
+	let offered: string[] = [];
+	t.ctx.ui.select = async (_title: string, choices: string[]) => { offered = choices; return choices[0]; };
+	await t.command("pick");
+	assert.deepEqual(offered, [...new Set<string>(before.filter((r: string) => r.startsWith(`${provider}/`)).map((r: string) => r.slice(provider.length + 1)))].sort());
+	assert.equal(t.ctx.model.provider, provider);
+	assert.equal(t.thinkingLevel(), "low");
+	assert.deepEqual(t.ctx.modelRegistry.getAvailable().map((m: any) => `${m.provider}/${m.id}`), before);
+});
+
+test("cancelled or stale account picker never changes the model", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, thinkingLevel: "high" });
+	t.ctx.hasUI = true;
+	t.ctx.modelRegistry.getAvailable = () => t.ctx.modelRegistry.getAll();
+	const original = t.ctx.model;
+	t.ctx.ui.select = async () => undefined;
+	await t.command("pick");
+	assert.equal(t.ctx.model, original);
+	t.ctx.ui.select = async (_title: string, choices: string[]) => { t.setIdle(false); return choices[0]; };
+	await t.command("pick");
+	assert.equal(t.ctx.model, original);
+});
+
+test("save-default persists the actual model and effort without changing other preferences", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, thinkingLevel: "low" });
+	t.ctx.cwd = AGENT_DIR;
+	writeFileSync(SETTINGS, JSON.stringify({ defaultThinkingLevel: "max", theme: "dark", modelThinkingLevels: { "other/model": "high" } }));
+	await t.command("save-default");
+	const saved = JSON.parse(readFileSync(SETTINGS, "utf8"));
+	assert.equal(saved.defaultProvider, t.ctx.model.provider);
+	assert.equal(saved.defaultModel, t.ctx.model.id);
+	assert.equal(saved.modelThinkingLevels[`${t.ctx.model.provider}/${t.ctx.model.id}`], "low");
+	assert.equal(saved.modelThinkingLevels["other/model"], "high");
+	assert.equal(saved.defaultThinkingLevel, "max");
+	assert.equal(saved.theme, "dark");
+	const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
+	const fresh = SettingsManager.create(AGENT_DIR, AGENT_DIR);
+	assert.equal(fresh.getModelThinkingLevel(fresh.getDefaultProvider()!, fresh.getDefaultModel()!), "low");
+});
+
+test("account controls cannot change a child-owned route or defaults", async () => {
+	const t = setup({ subagentChild: true });
+	t.ctx.hasUI = true;
+	t.ctx.ui.select = async () => { assert.fail("a child must not open the picker"); };
+	writeFileSync(SETTINGS, "{}");
+	await t.command("pick");
+	await t.command("save-default");
+	assert.deepEqual(t.rec.setModels, []);
+	assert.equal(readFileSync(SETTINGS, "utf8"), "{}");
+});
+
+test("save-default rechecks session ownership after loading the host settings API", async () => {
+	const t = setup({ thinkingLevel: "high" });
+	writeFileSync(SETTINGS, "{}");
+	const saving = t.command("save-default");
+	t.setIdle(false);
+	await saving;
+	assert.equal(readFileSync(SETTINGS, "utf8"), "{}");
+});
+
+test("account picker ignores a selection after another account takes ownership", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	t.ctx.hasUI = true;
+	t.ctx.modelRegistry.getAvailable = () => t.ctx.modelRegistry.getAll();
+	t.ctx.ui.select = async (_title: string, choices: string[]) => {
+		t.ctx.model = { provider: "openai-codex-account-2", id: "gpt-5.5" };
+		return choices[0];
+	};
+	await t.command("pick");
+	assert.deepEqual(t.rec.setModels, []);
+});
+
+test("save-default refuses a busy session", async () => {
+	const t = setup({ idle: false });
+	writeFileSync(SETTINGS, "{}");
+	await t.command("save-default");
+	assert.equal(readFileSync(SETTINGS, "utf8"), "{}");
+});
 
 function wait(ms: number) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -2258,6 +2374,44 @@ test("manual switch revives a stuck invalidation and selects the account", async
 	);
 });
 
+test("a continuation that hits quota on its fallback continues onto the next account", async () => {
+	const accounts: Account = {
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "codex-2",
+			refresh: "codex-2-refresh",
+			accountId: "codex-2",
+		},
+		"openai-codex-account-4": {
+			type: "oauth",
+			access: "codex-4",
+			refresh: "codex-4-refresh",
+			accountId: "codex-4",
+		},
+		anthropic: { type: "oauth", access: "anthropic-live", refresh: "anthropic-refresh" },
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		config: { autoDiscover: false },
+		omitContinueAgent: true,
+	});
+	await finishError(t, "openai-codex-account-2", "gpt-5.5", "429 rate limit");
+	assert.equal(t.ctx.model.provider, "openai-codex-account-4");
+	assert.equal(t.rec.sent.length, 1, "the first failover must continue the task");
+
+	await t.fire("before_agent_start", {});
+	await t.fire("agent_start", {});
+	await finishError(t, "openai-codex-account-4", "gpt-5.5", "429 rate limit");
+
+	assert.equal(t.ctx.model.provider, "anthropic");
+	assert.equal(
+		t.rec.sent.length,
+		2,
+		"stale continuation state must not suppress the next failover continuation",
+	);
+});
+
 test("a second account failure in the same agent chain is not hidden by the previous switch", async () => {
 	const accounts: Account = {
 		"openai-codex-account-2": {
@@ -2601,6 +2755,106 @@ test("all-limited work resumes in the same live session after cooldown", async (
 		"the task resumes once the account cooldown expires",
 	);
 	assert.ok(!t.readState().pendingFrom);
+});
+
+test("quota recovery is independent from immediate auto-continue", async () => {
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			autoContinue: false,
+			resumeAfterAllAccountsRecover: true,
+			cooldownMs: 1000,
+			probeCooldownMs: 1000,
+		},
+		omitContinueAgent: true,
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.ok(t.readState().pendingFrom, "the separate quota-recovery option must arm the wait");
+	await wait(1200);
+	assert.equal(t.rec.sent.length, 1, "the recovered task must resume without ordinary autoContinue");
+	assert.equal(t.readState().pendingFrom, undefined);
+});
+
+test("quota recovery can be disabled without disabling immediate auto-continue", async () => {
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			autoContinue: true,
+			resumeAfterAllAccountsRecover: false,
+			cooldownMs: 1000,
+		},
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.equal(t.readState().pendingFrom, undefined, "the explicit all-limited opt-out must not park work");
+	await wait(1100);
+	assert.equal(t.rec.continueCalls.length, 0);
+});
+
+test("reloading config cancels an owned quota wake when the option is turned off", async () => {
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			resumeAfterAllAccountsRecover: true,
+			cooldownMs: 60_000,
+		},
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.ok(t.readState().pendingFrom);
+	const raw = JSON.parse(readFileSync(CONFIG, "utf8"));
+	writeFileSync(CONFIG, JSON.stringify({ ...raw, resumeAfterAllAccountsRecover: false }));
+	await t.command("reload");
+	assert.equal(t.readState().pendingFrom, undefined);
+	await t.fire("session_shutdown");
+});
+
+test("all-limited recovery polls provider availability even when the footer is hidden", async () => {
+	const originalFetch = globalThis.fetch;
+	let probes = 0;
+	globalThis.fetch = (async () => {
+		probes++;
+		return new Response(JSON.stringify({
+			plan_type: "plus",
+			rate_limit: {
+				allowed: true,
+				limit_reached: false,
+				primary_window: {
+					used_percent: 20,
+					limit_window_seconds: 18_000,
+					reset_at: Math.floor(Date.now() / 1000) + 3600,
+				},
+			},
+		}), { status: 200 });
+	}) as typeof fetch;
+	const t = setup({
+		accounts: {
+			"openai-codex": {
+				type: "oauth",
+				access: "quota-recovery-secret",
+				refresh: "quota-recovery-refresh",
+				accountId: "quota-recovery-workspace",
+			},
+		},
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: {
+			showUsage: false,
+			resumeAfterAllAccountsRecover: true,
+			cooldownMs: 60_000,
+			pendingPollMs: 25,
+		},
+	});
+	try {
+		await finishError(t, "openai-codex", "gpt-5.5", "429 rate limit");
+		assert.ok(t.readState().pendingFrom, "a long estimated cooldown must leave a live wake");
+		await wait(1200);
+		assert.ok(probes > 0, "quota recovery must probe independently of footer visibility");
+		assert.equal(t.rec.continueCalls.length, 1, "fresh allowed=true must wake the task promptly");
+	} finally {
+		globalThis.fetch = originalFetch;
+		await t.fire("session_shutdown");
+	}
 });
 
 test("session shutdown cancels pending work permanently", async () => {
@@ -3270,8 +3524,9 @@ test("public Anthropic and Qwen provider streams shape native requests without s
 			id: anthropic ? "claude-sonnet-4-6" : "qwen-max", baseUrl: "https://fixture.invalid/v1",
 			reasoning: true, input: ["text"], contextWindow: 10000, maxTokens: 100,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: { supportsDeveloperRole: true },
-		}, { messages: [{ role: "system", content: "fixture instructions", timestamp: 0 },
-			{ role: "user", content: "fixture task", timestamp: 1 }] }, {
+		}, Number(PI_HOST_VERSION.split(".")[1]) >= 86
+			? { messages: [{ role: "system", content: "fixture instructions", timestamp: 0 }, { role: "user", content: "fixture task", timestamp: 1 }] }
+			: { systemPrompt: "fixture instructions", messages: [{ role: "user", content: "fixture task", timestamp: 0 }] }, {
 			apiKey: anthropic ? "sk-ant-oat01-fixture" : "fixture", maxRetries: 0,
 			onPayload: async (payload: any) => ({ ...payload, callerMarker: true }),
 			fetch: async (_url: any, init: any) => {
@@ -3608,6 +3863,385 @@ test("in-process child activations are passive and root reload reacquires owners
 		await finishError(reloaded, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
 		assert.ok(reloaded.rec.setModels.length > 0, "reload cannot permanently disable root failover");
 	} finally { await reloaded.fire("session_shutdown"); }
+});
+
+test("pi-web hosted sibling sessions each activate: the in-process lease does not demote them", async () => {
+	// pi-web's session daemon (PI_WEB_SESSION=1) hosts many independent root sessions in one
+	// process. The terminal-Pi lease heuristic would demote every session but the first to
+	// subagent-child-passive, silently disabling failover in all of them.
+	const first = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, piWebHost: true });
+	first.ctx.sessionManager = { getBranch: () => [] };
+	await first.fire("session_start");
+	const second = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		piWebHost: true,
+		seedState: { lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" } } });
+	second.ctx.sessionManager = { getBranch: () => [] };
+	try {
+		await second.fire("session_start");
+		await finishError(second, "openai-codex", "gpt-5.6-sol", "429 rate_limit_error");
+		assert.ok(second.rec.setModels.length > 0,
+			"a pi-web sibling session is a root session: it must own its failover");
+	} finally { await second.fire("session_shutdown"); await first.fire("session_shutdown"); }
+});
+
+test("PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS lets any multi-session host opt in", async () => {
+	// Enso and other in-process SDK hosts are not pi-web: they opt in with the host-neutral
+	// switch instead of borrowing pi-web's marker (which other extensions also read).
+	const first = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, independentRoots: true });
+	first.ctx.sessionManager = { getBranch: () => [] };
+	await first.fire("session_start");
+	const second = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		independentRoots: true,
+		seedState: { lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" } } });
+	second.ctx.sessionManager = { getBranch: () => [] };
+	try {
+		await second.fire("session_start");
+		await finishError(second, "openai-codex", "gpt-5.6-sol", "429 rate_limit_error");
+		assert.ok(second.rec.setModels.length > 0,
+			"an independent-roots host session must own its failover");
+	} finally { await second.fire("session_shutdown"); await first.fire("session_shutdown"); }
+});
+
+test("shared proxy survives either independent-root shutdown order", async () => {
+	for (const firstToClose of [true, false]) {
+		rmSync(MODELS, { force: true });
+		const accounts: Account = {
+			"openai-codex": { type: "oauth", access: "base-fixture", refresh: "base-refresh", accountId: "base" },
+			"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+		};
+		const first = setup({ accounts, piWebHost: true, current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+			config: { autoContinue: false, preferLatestModel: false } });
+		first.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "web-root-a" };
+		await first.fire("session_start");
+		const publishedRoute = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key");
+		const second = setup({ reuseSlotProxyPort: true, accounts: {
+			...JSON.parse(readFileSync(AUTH, "utf8")),
+			"openai-codex-account-3": { type: "oauth", access: "third-fixture", refresh: "third-refresh", accountId: "third" },
+		},
+			piWebHost: true, current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+			config: { autoContinue: false, preferLatestModel: false } });
+		second.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "web-root-b" };
+		let firstClosed = false;
+		let secondClosed = false;
+		try {
+			await second.fire("session_start");
+			const extraRoute = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-3"].baseUrl;
+			assert.equal(new URL(extraRoute).port, new URL(publishedRoute).port);
+			await (firstToClose ? first : second).fire("session_shutdown");
+			if (firstToClose) firstClosed = true;
+			else secondClosed = true;
+			assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key",
+				"a live sibling must keep OAuth behind the child-facing placeholder");
+			assert.equal(JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl, publishedRoute);
+			assert.equal((await callProxy(publishedRoute, "/codex/responses", {})).status, 401,
+				"the canonical listener must still reject unauthenticated children");
+			assert.equal((await callProxy(extraRoute, "/codex/responses", {})).status, 401,
+				`a slot introduced by the sibling must remain routable when ${firstToClose ? "first" : "second"} exits first`);
+			const thirdSlot = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-3"];
+			const realFetch = globalThis.fetch;
+			try {
+				globalThis.fetch = (async (_input: any, init: any) => {
+					assert.equal(init.headers.authorization, "Bearer third-fixture",
+						"the surviving root must still retrieve the sibling's credential from the sidecar");
+					return new Response("{}", { status: 200 });
+				}) as typeof fetch;
+				assert.equal((await callProxy(extraRoute, "/codex/responses", {
+					authorization: `Bearer ${thirdSlot.apiKey}`,
+				})).status, 200);
+			} finally { globalThis.fetch = realFetch; }
+			await (firstToClose ? second : first).fire("session_shutdown");
+			if (firstToClose) secondClosed = true;
+			else firstClosed = true;
+			assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "oauth",
+				"only the final root restores the child-facing auth file");
+			assert.equal(JSON.parse(readFileSync(MODELS, "utf8")).providers?.["openai-codex-account-2"], undefined);
+			await assert.rejects(callProxy(publishedRoute, "/codex/responses", {}),
+				(error: any) => error?.code === "ECONNREFUSED" || error?.code === "ECONNRESET",
+				"the final root must close the canonical listener");
+		} finally {
+			if (!secondClosed) await second.fire("session_shutdown");
+			if (!firstClosed) await first.fire("session_shutdown");
+			rmSync(MODELS, { force: true });
+		}
+	}
+});
+
+test("same-session rehydrate takes over failover without releasing shared proxy", async () => {
+	rmSync(MODELS, { force: true });
+	const accounts: Account = {
+		"openai-codex": { type: "oauth", access: "base-fixture", refresh: "base-refresh", accountId: "base" },
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const original = setup({ accounts, piWebHost: true, current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		hostCodexModels: ["gpt-5.6-sol"], config: { autoContinue: false, preferLatestModel: false } });
+	original.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "restored-session" };
+	await original.fire("session_start");
+	const publishedRoute = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+	const replacement = setup({ reuseSlotProxyPort: true, accounts: JSON.parse(readFileSync(AUTH, "utf8")),
+		piWebHost: true, current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		hostCodexModels: ["gpt-5.6-sol"], config: { autoContinue: false, preferLatestModel: false } });
+	replacement.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "restored-session" };
+	let originalClosed = false;
+	try {
+		await replacement.fire("session_start");
+		await finishError(replacement, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.ok(replacement.rec.setModels.includes("openai-codex-account-2/gpt-5.6-sol"));
+		await finishError(original, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.deepEqual(original.rec.setModels, [], "superseded instance must not switch the same session again");
+		await original.fire("session_shutdown");
+		originalClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key");
+		assert.equal((await callProxy(publishedRoute, "/codex/responses", {})).status, 401);
+	} finally {
+		if (!originalClosed) await original.fire("session_shutdown");
+		await replacement.fire("session_shutdown");
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "oauth");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("terminal Pi rehydrates the same session without admitting a different child", async () => {
+	rmSync(MODELS, { force: true });
+	const accounts: Account = {
+		"openai-codex": { type: "oauth", access: "base-fixture", refresh: "base-refresh", accountId: "base" },
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const makeSession = (sessionId: string, reuseSlotProxyPort = false) => {
+		const t = setup({ accounts: reuseSlotProxyPort ? JSON.parse(readFileSync(AUTH, "utf8")) : accounts,
+			reuseSlotProxyPort, current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+			hostCodexModels: ["gpt-5.6-sol"], config: { autoContinue: false, preferLatestModel: false } });
+		t.ctx.sessionManager = { getBranch: () => [], getSessionId: () => sessionId };
+		return t;
+	};
+	const first = makeSession("terminal-session");
+	await first.fire("session_start");
+	const publishedRoute = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+	const resumed = makeSession("terminal-session", true);
+	let firstClosed = false;
+	let different: ReturnType<typeof setup> | undefined;
+	try {
+		await resumed.fire("session_start");
+		await finishError(resumed, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.ok(resumed.rec.setModels.includes("openai-codex-account-2/gpt-5.6-sol"));
+		await finishError(first, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.deepEqual(first.rec.setModels, []);
+		await first.fire("session_shutdown");
+		firstClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key");
+		assert.equal((await callProxy(publishedRoute, "/codex/responses", {})).status, 401);
+		different = makeSession("different-child", true);
+		await different.fire("session_start");
+		await finishError(different, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.deepEqual(different.rec.setModels, [], "a distinct in-process terminal child stays passive");
+	} finally {
+		if (different) await different.fire("session_shutdown");
+		if (!firstClosed) await first.fire("session_shutdown");
+		await resumed.fire("session_shutdown");
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "oauth");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("overlapping independent-root startup and shutdown retains the canonical proxy", async () => {
+	rmSync(MODELS, { force: true });
+	const accounts: Account = {
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const first = setup({ accounts, piWebHost: true, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	first.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "overlap-first" };
+	const firstStart = first.fire("session_start");
+	const second = setup({ reuseSlotProxyPort: true, accounts: JSON.parse(readFileSync(AUTH, "utf8")),
+		piWebHost: true, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	second.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "overlap-second" };
+	let firstClosed = false;
+	try {
+		const secondStart = second.fire("session_start");
+		await first.fire("session_shutdown");
+		firstClosed = true;
+		await Promise.all([firstStart, secondStart]);
+		const route = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+		assert.equal(new URL(route).port, String(currentSlotProxyPort()));
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key");
+		assert.equal((await callProxy(route, "/codex/responses", {})).status, 401);
+	} finally {
+		if (!firstClosed) await first.fire("session_shutdown");
+		await second.fire("session_shutdown");
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "oauth");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("a proxy-disabled sibling cannot expose or unpublish another root's placeholders", async () => {
+	rmSync(MODELS, { force: true });
+	const accounts: Account = {
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const owner = setup({ accounts, piWebHost: true, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	owner.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "proxy-owner" };
+	await owner.fire("session_start");
+	const route = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+	const disabled = setup({ reuseSlotProxyPort: true, accounts: JSON.parse(readFileSync(AUTH, "utf8")),
+		piWebHost: true, config: { childProxy: false }, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	disabled.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "proxy-disabled-sibling" };
+	let disabledClosed = false;
+	try {
+		await disabled.fire("session_start");
+		assert.equal(disabled.providerConfigs.get("openai-codex-account-2")?.baseUrl, route,
+			"the sibling must not send a published placeholder to public ChatGPT");
+		await disabled.fire("session_shutdown");
+		disabledClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key");
+		assert.equal(JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl, route);
+		assert.equal((await callProxy(route, "/codex/responses", {})).status, 401);
+	} finally {
+		if (!disabledClosed) await disabled.fire("session_shutdown");
+		await owner.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("a preloaded proxy-disabled sibling repairs a public alias after another root shadows it", async () => {
+	rmSync(MODELS, { force: true });
+	const accounts: Account = {
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const owner = setup({ accounts, piWebHost: true, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	owner.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "late-owner" };
+	const disabled = setup({ reuseSlotProxyPort: true, accounts, piWebHost: true,
+		config: { childProxy: false }, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	disabled.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "preloaded-disabled" };
+	assert.equal(disabled.providerConfigs.get("openai-codex-account-2")?.baseUrl, "https://chatgpt.com/backend-api",
+		"before publication, a proxy-disabled root can register the real OAuth route");
+	let ownerClosed = false;
+	let disabledClosed = false;
+	try {
+		await owner.fire("session_start");
+		const route = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+		await disabled.fire("session_start");
+		assert.equal(disabled.providerConfigs.get("openai-codex-account-2")?.baseUrl, route,
+			"startup must re-register the alias rather than send a new placeholder to ChatGPT");
+		await disabled.fire("session_shutdown");
+		disabledClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key");
+		await owner.fire("session_shutdown");
+		ownerClosed = true;
+	} finally {
+		if (!disabledClosed) await disabled.fire("session_shutdown");
+		if (!ownerClosed) await owner.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("an already-running proxy-disabled root switches its alias before a sibling publishes placeholders", async () => {
+	rmSync(MODELS, { force: true });
+	const accounts: Account = {
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const enabled = setup({ accounts, piWebHost: true, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	enabled.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "later-publisher" };
+	const disabled = setup({ reuseSlotProxyPort: true, accounts, piWebHost: true,
+		config: { childProxy: false }, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	disabled.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "already-running-disabled" };
+	await disabled.fire("session_start");
+	assert.equal(disabled.providerConfigs.get("openai-codex-account-2")?.baseUrl, "https://chatgpt.com/backend-api");
+	let enabledClosed = false;
+	try {
+		await enabled.fire("session_start");
+		const route = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+		assert.equal(disabled.providerConfigs.get("openai-codex-account-2")?.baseUrl, route,
+			"the public alias must be retired before any child-facing placeholder is published");
+		await enabled.fire("session_shutdown");
+		enabledClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key",
+			"the still-running disabled root must keep the canonical route alive");
+		assert.equal((await callProxy(route, "/codex/responses", {})).status, 401);
+	} finally {
+		if (!enabledClosed) await enabled.fire("session_shutdown");
+		await disabled.fire("session_shutdown");
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "oauth");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("unusable slots never restore hidden OAuth before the last root exits", async () => {
+	rmSync(MODELS, { force: true });
+	const slot = "openai-codex-account-2";
+	const first = setup({ piWebHost: true, accounts: {
+		[slot]: { type: "oauth", access: "expired-fixture", refresh: "fixture-refresh", accountId: "second" },
+	}, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	first.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "expired-first" };
+	await first.fire("session_start");
+	const sidecar = JSON.parse(readFileSync(PROXY_OAUTH_SIDECAR, "utf8"));
+	writeFileSync(PROXY_OAUTH_SIDECAR, JSON.stringify({
+		...sidecar, [slot]: { ...sidecar[slot], refresh: undefined, expires: 1 },
+	}));
+	const second = setup({ reuseSlotProxyPort: true, piWebHost: true,
+		accounts: JSON.parse(readFileSync(AUTH, "utf8")),
+		current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	second.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "expired-second" };
+	let firstClosed = false;
+	try {
+		await second.fire("session_start");
+		await first.fire("session_shutdown");
+		firstClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))[slot].type, "api_key",
+			"a still-active root may not expose unusable real OAuth in child-facing auth");
+	} finally {
+		if (!firstClosed) await first.fire("session_shutdown");
+		await second.fire("session_shutdown");
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))[slot].type, "oauth");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("a pi-subagents child process stays passive even under pi-web", async () => {
+	// The runner process inherits PI_WEB_SESSION=1 from the daemon AND sets PI_SUBAGENT_CHILD=1;
+	// the child marker must win over the pi-web lease exemption.
+	const child = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		subagentChild: true, piWebHost: true,
+		seedState: { lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" } } });
+	child.ctx.sessionManager = { getBranch: () => [] };
+	try {
+		await child.fire("session_start");
+		await finishError(child, "openai-codex", "gpt-5.6-sol", "429 rate_limit_error");
+		assert.deepEqual(child.rec.setModels, [], "parent runner alone owns child fallback");
+		assert.equal(child.rec.continueCalls.length, 0);
+	} finally { await child.fire("session_shutdown"); }
+});
+
+test("explicit child marker cannot join independent host's proxy membership", async () => {
+	rmSync(MODELS, { force: true });
+	const accounts: Account = {
+		"openai-codex": { type: "oauth", access: "base-fixture", refresh: "base-refresh", accountId: "base" },
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const root = setup({ accounts, independentRoots: true, current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { autoContinue: false, preferLatestModel: false } });
+	root.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "sdk-root" };
+	await root.fire("session_start");
+	const publishedRoute = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+	const child = setup({ reuseSlotProxyPort: true, accounts: JSON.parse(readFileSync(AUTH, "utf8")),
+		independentRoots: true, subagentChild: true, current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { autoContinue: false, preferLatestModel: false } });
+	child.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "sdk-child" };
+	let rootClosed = false;
+	try {
+		await child.fire("session_start");
+		await finishError(child, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.deepEqual(child.rec.setModels, [], "PI_SUBAGENT_CHILD takes precedence over the independent-root opt-in");
+		await root.fire("session_shutdown");
+		rootClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "oauth",
+			"a passive child cannot keep the parent's publication alive");
+		assert.equal(JSON.parse(readFileSync(MODELS, "utf8")).providers?.["openai-codex-account-2"], undefined);
+		await assert.rejects(callProxy(publishedRoute, "/codex/responses", {}),
+			(error: any) => error?.code === "ECONNREFUSED" || error?.code === "ECONNRESET");
+	} finally {
+		await child.fire("session_shutdown");
+		if (!rootClosed) await root.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
 });
 
 test("manual model selection adopts host per-model thinking defaults in auto mode", async () => {
@@ -4320,11 +4954,33 @@ test("a state-version migration still remembers the last live model", async () =
 	uninstallCursorProvider();
 });
 
-test("a logged-in kimi slot is provisioned into models.json so bare children resolve it natively", async () => {
+test("Kimi OAuth and empty spare slots never pollute the static registry", async () => {
+	for (const childProxy of [false, true]) {
+		for (const accounts of [ONE_ACCOUNT, {
+			"kimi-coding": { type: "oauth", access: "fixture-k", refresh: "fixture-r" },
+			"kimi-coding-account-2": { type: "oauth", access: "fixture-k2", refresh: "fixture-r2" },
+		}] as Account[]) {
+			writeFileSync(MODELS, JSON.stringify({ providers: { custom: { modelOverrides: { mine: { contextWindow: 1234 } } } } }));
+			const t = setup({ accounts, config: { childProxy } });
+			try {
+				for (const event of ["session_start", "rediscover", "reload"]) {
+					if (event === "session_start") await t.fire(event);
+					else await t.command(event);
+					const providers = JSON.parse(readFileSync(MODELS, "utf8")).providers;
+					assert.deepEqual(Object.keys(providers).filter(id => id.startsWith("kimi-coding")), []);
+					assert.equal(providers.custom.modelOverrides.mine.contextWindow, 1234);
+					assert.ok(t.providerConfigs.has("kimi-coding-account-2"), "login registration remains available");
+				}
+			} finally { await t.fire("session_shutdown"); }
+		}
+	}
+});
+
+test("a keyed Kimi slot is published for bare children without publishing its OAuth spare", async () => {
 	const t = setup({
 		accounts: {
-			"kimi-coding": { type: "oauth", access: "k", refresh: "kr" },
-			"kimi-coding-account-2": { type: "oauth", access: "k2", refresh: "kr2" },
+			"kimi-coding": { type: "api_key", key: "fixture-kimi-base" },
+			"kimi-coding-account-2": { type: "api_key", key: "fixture-kimi-slot" },
 		},
 	});
 	await t.fire("session_start");
@@ -4344,6 +5000,7 @@ test("a logged-in kimi slot is provisioned into models.json so bare children res
 		"Pi's models.json schema requires model objects, not string ids",
 	);
 	assert.ok(slot.models.some((model: { id: string }) => model.id === "k3"));
+	assert.equal(modelsJson.providers?.["kimi-coding-account-3"], undefined);
 	// settings.json untouched — Pi owns defaults; we only provision resolution data.
 	assert.equal(existsSync(SETTINGS), false);
 });
@@ -4363,7 +5020,7 @@ test("string model ids already in models.json are rewritten as objects", async (
 	);
 	const t = setup({
 		accounts: {
-			"kimi-coding-account-2": { type: "oauth", access: "k2", refresh: "kr2" },
+			"kimi-coding-account-2": { type: "api_key", key: "fixture-kimi-slot" },
 		},
 	});
 	await t.fire("session_start");
@@ -5506,6 +6163,22 @@ test("an un-continuable resume (e.g. tail aborted by the watchdog) recovers by i
 		1,
 		"it falls back to injecting the continuation prompt so the work keeps moving by itself",
 	);
+});
+
+test("a rejected prompt injection remains armed and retries on the selected fallback", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { pendingPollMs: 25 },
+		omitContinueAgent: true,
+		sendUserMessageRejects: 1,
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.equal(t.ctx.model.provider, "openai-codex-account-2");
+	assert.equal(t.rec.sent.length, 1, "the first injection attempt must reach the host");
+	assert.ok(t.readState().pendingFrom, "an asynchronous host rejection must re-arm the continuation");
+	await wait(1100);
+	assert.equal(t.rec.sent.length, 2, "the selected fallback must retry its continuation");
+	assert.equal(t.readState().pendingFrom, undefined);
 });
 
 test("host build WITHOUT pi.continueAgent still auto-resumes the failover (inject continuation prompt) instead of dead-ending with a red 'Update @earendil-works/pi-coding-agent' error", async () => {
@@ -7542,7 +8215,66 @@ test(
 			config: { autoDiscoverModels: true, reasoningLevel: "high" },
 		});
 
+		const registrationsBeforeStart = t.rec.registrations.length;
 		await t.fire("session_start");
+		const refreshedAliasRoutes = t.rec.registrations
+			.slice(registrationsBeforeStart)
+			.filter(
+				(registration) =>
+					registration.provider === "openai-codex-account-2" &&
+					typeof registration.baseUrl === "string",
+			);
+		assert.ok(
+			refreshedAliasRoutes.length > 0,
+			"session startup must re-register the numbered alias after catalog refresh",
+		);
+		assert.ok(
+			refreshedAliasRoutes.every((registration) =>
+				/^http:\/\/127\.0\.0\.1:\d+\/openai-codex-account-2$/.test(
+					registration.baseUrl!,
+				),
+			),
+			"every catalog-driven alias registration must preserve the loopback route",
+		);
+
+		const alias = t.providerConfigs.get("openai-codex-account-2");
+		assert.match(
+			String(alias?.baseUrl),
+			/^http:\/\/127\.0\.0\.1:\d+\/openai-codex-account-2$/,
+			"catalog refresh must preserve the account-specific loopback route",
+		);
+		assert.doesNotMatch(
+			String(alias?.baseUrl),
+			/^https:\/\/chatgpt\.com\//,
+			"the child-facing placeholder must never be sent directly to ChatGPT",
+		);
+
+		const childAuth = JSON.parse(readFileSync(AUTH, "utf8"));
+		assert.equal(
+			childAuth["openai-codex-account-2"]?.type,
+			"api_key",
+			"child-facing auth must keep the non-secret placeholder after catalog refresh",
+		);
+		const parentAuth = JSON.parse(readFileSync(PROXY_OAUTH_SIDECAR, "utf8"));
+		assert.equal(
+			parentAuth["openai-codex-account-2"]?.type,
+			"oauth",
+			"the parent-only sidecar must retain the real OAuth credential",
+		);
+
+		const published = [readFileSync(AUTH, "utf8"), readFileSync(MODELS, "utf8")].join(
+			"\n",
+		);
+		assert.equal(
+			published.includes("codex-access"),
+			false,
+			"child-facing files must not contain the OAuth access token",
+		);
+		assert.equal(
+			published.includes("codex-refresh"),
+			false,
+			"child-facing files must not contain the OAuth refresh token",
+		);
 		await t.fire("agent_start");
 		await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
 
@@ -7554,6 +8286,46 @@ test(
 		assert.ok(
 			!t.rec.thinkingLevels.includes("xhigh"),
 			"xhigh is an extreme opt-in level and must never be selected by default",
+		);
+		await t.fire("session_shutdown");
+	},
+);
+
+test(
+
+	"numbered Codex alias never receives a public route before its loopback proxy is ready",
+	{ concurrency: false },
+	async () => {
+		const t = setup({
+			accounts: {
+				anthropic: { type: "oauth", access: "anthropic-access", refresh: "anthropic-refresh" },
+				"openai-codex-account-2": {
+					type: "oauth",
+					access: "codex-access",
+					refresh: "codex-refresh",
+					accountId: "codex-account",
+				},
+			},
+			current: { provider: "anthropic", id: "claude-opus-4-8" },
+		});
+
+		const unsafeAliasRoutes = t.rec.registrations.filter(
+			(registration) =>
+				registration.provider === "openai-codex-account-2" &&
+				/^https:\/\/chatgpt\.com\//.test(registration.baseUrl ?? ""),
+		);
+		assert.deepEqual(
+			unsafeAliasRoutes,
+			[],
+			"a placeholder-backed numbered alias must not be registered to the public upstream before the proxy is ready",
+		);
+
+		await t.fire("session_start");
+		const alias = t.providerConfigs.get("openai-codex-account-2");
+		assert.match(
+			String(alias?.baseUrl),
+			/^http:\/\/127\.0\.0\.1:\d+\/openai-codex-account-2$/,
+			"proxy startup must make the numbered alias available through its loopback route",
 		);
 		await t.fire("session_shutdown");
 	},
@@ -9069,6 +9841,28 @@ test("a month-long 'believed spent' notice admits it is a forecast, not a month-
 		/forecast|re-?check|re-?tr(y|ied)/i,
 		`and must not present a quota forecast as a settled lockout; said: ${said}`,
 	);
+});
+
+test("header quota refresh preserves identity without reviving an old availability verdict", async () => {
+	const now = Date.now();
+	const provider = "openai-codex-account-2";
+	const hash = createHash("sha256").update("c-tok-2").digest("hex").slice(0, 12);
+	const t = setup({ config: { showUsage: false, childProxy: false }, seedState: {
+		stateVersion: 5, usageByProvider: { [provider]: {
+			provider, family: "codex", credentialHash: hash, fetchedAt: now - 3600000,
+			account: "fixture@example.com", plan: "pro", serviceable: true,
+			primary: { usedPercent: 10, resetAt: now + 3600000 },
+		} },
+	} });
+	await t.fire("after_provider_response", { request: { kind: "background", model: { provider, id: "gpt-5.5" } }, status: 429,
+		headers: { "x-codex-primary-used-percent": "100", "x-codex-primary-reset-at": String((now + 3600000) / 1000) } });
+	const snapshot = t.readState().usageByProvider[provider];
+	assert.equal(snapshot.account, "fixture@example.com");
+	assert.equal(snapshot.serviceable, undefined);
+	assert.equal(snapshot.primary.usedPercent, 100);
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 usage limit reached");
+	assert.ok(!t.rec.setModels.some(target => target.startsWith(`${provider}/`)), "100% account must not be selected");
+	await t.fire("session_shutdown");
 });
 
 test("an account the provider says is usable right now is used, whatever our bookkeeping predicted", async () => {

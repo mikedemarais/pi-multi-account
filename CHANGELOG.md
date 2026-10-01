@@ -23,9 +23,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The Anthropic OAuth billing header now reports the locally installed Claude Code (`claude --version`) when it is newer than `CLAUDE_CODE_VERSION`, so a pinned install keeps working when a new model requires a newer client (Opus 5.5 rejected 2.1.274). Set `PI_MULTI_ACCOUNT_DETECT_CLAUDE_CODE_VERSION=0` to use only the constant.
 
-- `neverFailoverProviders` now also bypasses foreground startup/input preflights for unmanaged providers. Stale cooldowns, invalidations, or unknown auth no longer silently replace an opted-out route before its request. Automatic switch and pending-resume boundaries enforce the same exemption; explicit manual switches remain available.
+## [1.23.2] — 2026-09-24
 
+### Fixed
+
+- Sessions hosted by pi-web's session daemon no longer deactivate after the first one. The in-process root-activation lease (designed for terminal Pi's `/reload` and in-process children) misclassified every later pi-web session as a subagent child, leaving it in `subagent-child-passive` mode with failover, preflight and auto-continue silently disabled. When `PI_WEB_SESSION=1` is present, each session now activates as an independent root; any other multi-session SDK host can opt in with the host-neutral `PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS=1`. Genuine pi-subagents children still run in a runner process marked `PI_SUBAGENT_CHILD=1` and remain passive.
+- In-process independent roots and same-session rehydrates now share a process-scoped canonical child proxy and publication lifetime. A sibling can exit in either order without restoring real OAuth into child-facing `auth.json` or orphaning `models.json` loopback routes; only the final root closes the listener and restores auth. A root whose proxy is disabled still retires public numbered aliases before another root publishes placeholders, and keeps that listener alive through handoff. The surviving root handles newly discovered slots, while explicit `PI_SUBAGENT_CHILD` remains passive.
+
+## [1.23.1] — 2026-09-23
+
+### Fixed
+
+- Restore `pi-ai` as an installed runtime dependency for the OAuth/catalog bridge (#75). Pi-managed npm, bun and pnpm extension installs deliberately omit peer dependencies; v1.23.0 made pi-ai peer-only, so a fresh install could not log into a numbered subscription account. Native provider transports remain bound to the running Pi host, not this bridge copy. The package check now rejects future peer-only regressions.
+
+## [1.23.0] — 2026-09-23
+
+### Added
+
+- `/multi-account pick` offers only the current account's models without filtering the shared registry or changing Pi core. `/multi-account save-default` saves the current model and effective thinking level together for new sessions, without making automatic failover overwrite startup preferences.
+- Added `resumeAfterAllAccountsRecover` (default `true`) as a separate live-session liveness control. A real quota/rate-limit wall across every compatible account remains armed even when immediate `autoContinue` is disabled, polls recovery independently of footer visibility, and resumes on the first account that is genuinely usable.
+
+### Compatibility
+
+- Pi and pi-ai are peer dependencies in the tested range >=0.85.1, <0.88.0. Transport imports bind to the running host rather than an extension-local 0.85 copy. CI covers Pi 0.85.1, 0.86.1 and 0.87.1; standalone SDK callers must use their installed pi-ai context format.
+
+### Fixed
+
+- Native provider wrappers preserve system instructions and tool definitions on Pi's transcript-based context, avoiding tool-free Anthropic requests and old token-estimator crashes (#65, #66).
+- Partial Codex usage headers preserve account/plan display metadata for the same credential without refreshing old serviceability, credits or missing quota windows. Includes a routing regression for stale `serviceable: true` plus fresh 100% quota (adapted from #67, thanks @HerbertGao).
+- Kimi OAuth and unauthenticated spare slots remain in the login picker but are no longer published as unusable static aliases. Only authenticated API-key aliases are published; existing user models.json entries remain untouched (#68).
+- Updated the Anthropic billing-header Claude Code version to 2.1.280 (#64).
+- A continuation that exhausted its newly selected fallback no longer stops after one hop: the next quota-driven switch receives its own continuation.
+- Asynchronous rejection of Pi's injected follow-up no longer loses the interrupted task; the selected fallback remains armed for a bounded retry.
+- `neverFailoverProviders` now also bypasses foreground startup/input preflights for unmanaged providers. Stale cooldowns, invalidations, or unknown auth no longer silently replace an opted-out route before its request. Automatic switch and pending-resume boundaries enforce the same exemption; explicit manual switches remain available.
 - A bodyless `429 status code (no body)` from an unmanaged provider now retries the same route instead of being treated as provider-wide credit exhaustion. The retry honors `Retry-After` when available and otherwise uses the transient delay, avoiding both an unrelated-provider failover and a false six-hour bench for providers such as Cerebras.
+- Numbered Codex OAuth slots no longer fall back to the public ChatGPT endpoint while the child proxy is enabled. A numbered alias is always registered against the loopback route that swaps in the real credential, from extension load onward, so the child-facing placeholder can never be sent to a provider that cannot read it (`Could not parse your authentication token`). Registration now requires an explicit route, so a future call site cannot silently reintroduce the public fallback.
 
 ## [1.22.0] — 2026-09-17
 
