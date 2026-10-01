@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Compatibility
+
+- Tested with Pi 0.99.2. The OAuth/catalog bridge now installs pi-ai 0.99.x, and CI also covers Pi 0.99.2.
+
 ### Added
 
 - Claude Sonnet 5.5 (`claude-sonnet-5-5`): Anthropic documents it for on-demand compaction, so native compaction now covers it. The OAuth billing header floor (`CLAUDE_CODE_VERSION`) is now 2.1.284, the first Claude Code release that serves Sonnet 5.5.
