@@ -26,7 +26,7 @@ pi install npm:pi-multi-account
 
 Restart Pi or run `/reload` after installation.
 
-Requires Node 22+ and Agent Pi / pi-ai **>=0.85.1, <0.88.0** (CI covers 0.85.1, 0.86.1 and 0.87.1).
+Requires Node 22+ and Agent Pi / pi-ai **>=0.87.1** (CI covers 0.87.1 and 0.99.2).
 Pi's host package is a peer. `pi-ai` is a runtime dependency for the OAuth/catalog bridge:
 Pi-managed installs intentionally do not install extension peer dependencies, but subscription
 login must be able to locate pi-ai on disk. Provider transports still use Pi's **host-bound**
