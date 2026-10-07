@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Compatibility
 
-- Requires Pi >=0.87.1; tested with 0.87.1 and 0.99.2. The OAuth/catalog bridge now installs pi-ai 0.99.x.
+- Requires Pi >=0.87.1; tested with 0.87.1 and 1.0.4. The OAuth/catalog bridge now installs pi-ai 1.0.x.
 
 ### Added
 

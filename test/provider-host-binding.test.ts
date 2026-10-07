@@ -30,7 +30,9 @@ export default function(pi) { pi.registerProvider("fixture", { api: ${JSON.strin
 			assert.deepEqual(loaded.errors, []);
 			const streamSimple = loaded.runtime.pendingProviderRegistrations.find(r => r.name === "fixture")!.config.streamSimple!;
 			const tool = { name: "probe", description: "fixture", parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } };
-			const modern = Number(VERSION.split(".")[1]) >= 86;
+			// Pi 0.86+ takes system messages in the transcript. Compare major too: Pi 1.0 has minor 0.
+			const [major, minor] = VERSION.split(".").map(Number);
+			const modern = major > 0 || minor >= 86;
 			const context: any = modern ? { messages: [
 				{ role: "system", content: "SYSTEM_MARKER", toolsAdded: [{ ...tool, name: "obsolete" }], timestamp: 0 },
 				{ role: "system", content: "UPDATED_MARKER", toolsRemoved: [{ name: "obsolete" }], toolsAdded: [tool], timestamp: 1 },
