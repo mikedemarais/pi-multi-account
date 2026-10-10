@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `/multi-account remove` and `/multi-account clear` work again on Pi >=0.87, which no longer exposes its AuthStorage to extensions. Removal failed with "credential deletion failed" and left the account in place. It now deletes the one entry under Pi's cross-process `auth.json` lock, re-reading the file so a concurrent login or refresh is kept.
+
 - Numbered Claude slots keep Pi's registry metadata for a model only Pi's remote catalog knows, such as `claude-sonnet-5-5` before pi-ai ships it. Re-registering the slots at session start previously replaced it with a 200K-context, 32K-output placeholder with no thinking levels or compat flags.
 
 - Pi starts about 0.13s faster. Numbered Claude and Kimi slots now read model metadata from the host's already-loaded pi-ai when Pi's extension loader provides it, instead of loading this package's own pi-ai and its whole provider catalog again. Other hosts keep the previous lookup.

@@ -5457,6 +5457,28 @@ test("removing a shadow-backed slot also removes its parent-only OAuth sidecar",
 	await t.fire("session_shutdown");
 });
 
+test("remove works on Pi >= 0.87, which exposes no AuthStorage to extensions", async () => {
+	const slot = "anthropic-account-3";
+	const t = setup({
+		hostAuthStorage: "pi-0.87",
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			[slot]: { type: "oauth", access: "c", refresh: "cr" },
+			unrelated: { type: "api_key", key: "keep-me" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	await t.command(`remove ${slot}`);
+	const auth = JSON.parse(readFileSync(AUTH, "utf8"));
+	assert.equal(auth[slot], undefined);
+	assert.equal(auth.anthropic.refresh, "ar");
+	assert.equal(auth.unrelated.key, "keep-me");
+	assert.ok(!t.rec.notifies.some((n) => /deletion failed/.test(n)), t.rec.notifies.join("; "));
+	assert.match(t.rec.notifies.at(-1) ?? "", new RegExp(`removed ${slot}`));
+	await t.fire("session_shutdown");
+});
+
 test("remove without args prints usage", async () => {
 	const t = setup({ accounts: ONE_ACCOUNT });
 	await t.command("remove");

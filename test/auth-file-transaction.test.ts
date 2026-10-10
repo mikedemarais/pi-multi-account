@@ -76,3 +76,22 @@ test("a refresh holding the auth lock past 10 s is not broken by Pi's sync lock 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("locked delete waits for Pi's auth lock and removes only its entry from the latest file", async () => {
+  const root = mkdtempSync(join(tmpdir(), "auth-delete-"));
+  const auth = join(root, "auth.json");
+  try {
+    writeFileSync(auth, JSON.stringify({ [slot]: token, kept: { type: "api_key", key: "fixture-kept" } }));
+    const release = lockfile.lockSync(auth, { realpath: false });
+    const pending = lockedAuthFileStorage(auth).delete(slot);
+    // A login lands while the lock is held; the delete must not overwrite it.
+    writeFileSync(auth, JSON.stringify({ ...JSON.parse(readFileSync(auth, "utf8")), concurrent: { type: "api_key", key: "fixture-new" } }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(JSON.parse(readFileSync(auth, "utf8"))[slot], "delete must wait for the lock");
+    release();
+    await pending;
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(auth, "utf8"))).sort(), ["concurrent", "kept"]);
+    await lockedAuthFileStorage(auth).delete("absent");
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(auth, "utf8"))).sort(), ["concurrent", "kept"]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

@@ -9165,7 +9165,15 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		if (!raw[id] && !sidecar[id]) return false;
 		// Delete the Pi-owned credential first. A sidecar without its exact placeholder is inert;
 		// deleting the sidecar first could lose the only real OAuth copy if the host delete fails.
-		if (raw[id] && !(await removeCredentialFromAuthStorage(ctx?.modelRegistry?.authStorage, id))) {
+		// Pi >= 0.87 no longer exposes its AuthStorage to extensions; take its auth.json lock directly.
+		const hostAuthStorage = ctx?.modelRegistry?.authStorage;
+		const authStorage =
+			typeof hostAuthStorage?.delete === "function"
+				? hostAuthStorage
+				: lockedAuthFileStorage(AUTH_PATH, (error) =>
+						logEvent("auth_lock_compromised", { provider: id, error: error.message }),
+					);
+		if (raw[id] && !(await removeCredentialFromAuthStorage(authStorage, id))) {
 			if (notifyFailure) ctx.ui.notify(
 				"pi-multi-account: credential deletion failed; the account and its recovery copy were preserved.", "error");
 			return false;
