@@ -107,9 +107,9 @@ export function lockedAuthFileStorage(authPath: string, onCompromised?: (error: 
       }
     },
     /** Remove one entry under the same lock, keeping every other entry from the latest file. */
-    async delete(provider: string, options?: { signal?: AbortSignal }): Promise<void> {
+    async delete(provider: string): Promise<void> {
       ensureAuthFile(authPath);
-      const release = await acquireAuthLock(authPath, options?.signal, onCompromised);
+      const release = await acquireAuthLock(authPath, undefined, onCompromised);
       try {
         const { [provider]: removed, ...rest } = read(authPath);
         if (removed !== undefined) atomicWrite(authPath, rest);

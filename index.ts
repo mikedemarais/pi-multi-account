@@ -9505,7 +9505,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			} catch {
 				// non-fatal: in-memory state is still cleared
 			}
-			// Remove all numbered alias slots through Pi's locked credential API so `/multi-account add`
+			// Remove all numbered alias slots under Pi's auth.json lock so `/multi-account add`
 			// starts fresh at account-2 without overwriting a concurrent login or refresh. Keep base
 			// providers (no -account-N suffix) and unrelated providers (openrouter, deepseek, zai, etc.).
 			const removedSlots = [
