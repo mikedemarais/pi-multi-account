@@ -5008,6 +5008,31 @@ test("a keyed Kimi slot is published for bare children without publishing its OA
 	assert.equal(existsSync(SETTINGS), false);
 });
 
+test("explicit first Claude slot is offered before login and registered after restart", async () => {
+	for (const loggedIn of [false, true]) {
+		const t = setup({
+			accounts: {
+				...(loggedIn ? { "anthropic-account-1": { type: "oauth", access: "fixture-one", refresh: "fixture-r1" } } : {}),
+				"anthropic-account-2": { type: "oauth", access: "fixture-two", refresh: "fixture-r2" },
+			},
+			current: { provider: "anthropic-account-2", id: "claude-opus-4-8" },
+			config: { childProxy: false, showUsage: false },
+		});
+		try {
+			const first = t.providerConfigs.get("anthropic-account-1");
+			assert.ok(first?.oauth?.login, "account-1 needs its own login, not the bare base provider");
+			assert.ok(first.models.some((model: any) => model.id === "claude-opus-4-8"));
+			await t.fire("session_start");
+			if (loggedIn) {
+				await t.command("switch anthropic-account-1/claude-opus-4-8");
+				assert.equal(t.ctx.model.provider, "anthropic-account-1");
+				await t.fire("message_end", { message: { role: "assistant", provider: "anthropic-account-1", model: "claude-opus-4-8", stopReason: "error", errorMessage: "429 rate limit exceeded" } });
+				assert.equal(t.ctx.model.provider, "anthropic-account-2", "numbered Claude siblings rotate without a base credential");
+			}
+		} finally { await t.fire("session_shutdown"); }
+	}
+});
+
 test("string model ids already in models.json are rewritten as objects", async () => {
 	writeFileSync(
 		MODELS,

@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Explicit `anthropic-account-1` is available in `/login` before authentication and remains registered after restart. Slot discovery previously converted index 1 to the bare `anthropic` provider and skipped its registration, so a stored first numbered account had no transport. Both numbered Claude subscriptions now rotate without requiring a base credential.
+
 - `/multi-account remove` and `/multi-account clear` work again on Pi >=0.87, which no longer exposes its AuthStorage to extensions. Removal failed with "credential deletion failed" and left the account in place. It now deletes the one entry under Pi's cross-process `auth.json` lock, re-reading the file so a concurrent login or refresh is kept.
 
 - Numbered Claude slots keep Pi's registry metadata for a model only Pi's remote catalog knows, such as `claude-sonnet-5-5` before pi-ai ships it. Re-registering the slots at session start previously replaced it with a 200K-context, 32K-output placeholder with no thinking levels or compat flags.

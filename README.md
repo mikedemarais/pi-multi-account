@@ -67,6 +67,12 @@ ChatGPT Plus/Pro (Codex openai-codex-account-2)
 Pi 0.79.3 does not accept a provider argument after `/login`; select the account
 slot from the interactive provider picker instead.
 
+Claude subscriptions may use explicit `anthropic-account-1` and
+`anthropic-account-2` names. The first numbered slot is always offered in
+`/login`; it has independent credentials and request shaping, just like the
+other numbered slots. The bare `anthropic` provider remains supported for
+existing setups. Never log the same subscription into both names.
+
 Check what's in the rotation at any time:
 
 ```text

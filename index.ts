@@ -6501,14 +6501,13 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			"qwen",
 		];
 		for (const family of families) {
-			const authedIndexes = Object.keys(auth)
-				.filter(
-					(id) =>
-						classifyProvider(id, config.qwenProvider) === family &&
-						isEntryUsable(auth[id]),
-				)
-				.map(slotIndex);
-			const wanted = new Set<number>(authedIndexes);
+			const authedIds = Object.keys(auth).filter(
+				(id) => classifyProvider(id, config.qwenProvider) === family && isEntryUsable(auth[id]),
+			);
+			const wanted = new Set<string>(authedIds);
+			// An explicit first Claude slot is distinct from the native `anthropic` provider.
+			// Offer it before login too, so two subscriptions can be named account-1 and account-2.
+			if (family === "anthropic") wanted.add("anthropic-account-1");
 			// For OAuth families, add the next free slot (>=2) so the user can select it
 			// from /login. API-key families (ollama/qwen) have no interactive login, so a
 			// spare slot with no key would just produce a Pi error ("apiKey or oauth
@@ -6520,18 +6519,18 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 				family === "cursor"
 			) {
 				let spare = 2;
-				while (wanted.has(spare) && spare <= config.maxAccountsPerProvider)
+				while (wanted.has(slotId(family, spare, config.qwenProvider)) && spare <= config.maxAccountsPerProvider)
 					spare++;
-				if (spare <= config.maxAccountsPerProvider) wanted.add(spare);
+				if (spare <= config.maxAccountsPerProvider) wanted.add(slotId(family, spare, config.qwenProvider));
 			}
-			for (const index of wanted) {
-				const id = slotId(family, index, config.qwenProvider);
+			for (const id of wanted) {
+				const index = slotIndex(id);
 				if (family === "cursor") {
 					if (index <= 1) continue;
 					if (!registeredSlots.has(id)) registeredSlots.add(id);
 					continue;
 				}
-				if (index <= 1) continue; // base provider is native
+				if (index <= 1 && id !== "anthropic-account-1") continue; // bare base provider is native
 				// An api-key slot registered before a ctx existed carries only the built-in tag.
 				// Once the host registry is reachable its models must be folded in, so those slots
 				// are re-registered whenever the host set changes rather than skipped forever.
