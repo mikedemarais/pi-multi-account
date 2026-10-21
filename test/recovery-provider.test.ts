@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createPayloadStream, PAYLOAD_ADMISSION } from "../provider-payload-stream.ts";
-import { recoveryProviderAPI, hasRecoveryAdmission, type RecoveryProviderCoverage } from "../recovery-provider.ts";
+import { recoveryProviderAPI, hasRecoveryAdmission, RECOVERY_INNER_STREAM, type RecoveryProviderCoverage } from "../recovery-provider.ts";
 
 const model = { provider: "owned", api: "owned-api", id: "small" };
 function fixture() {
@@ -67,5 +67,20 @@ test("native object registration preserves auth and guards both stream methods",
 	for (const method of ["stream", "streamSimple"]) await assert.rejects(f.native.get("owned")[method](model, {}, {}).result(), /guarded/);
 	assert.equal(sent, 0);
 	f.native.get("owned").streamSimple = () => ({});
+	assert.equal(hasRecoveryAdmission(f.registry, model, f.coverage), false);
+});
+
+test("a downstream wrapper keeps coverage only by declaring the owned stream it forwards to", async () => {
+	const f = fixture(); let wrapped: any;
+	// Like a host extension that wraps this package's registerProvider (Codex compaction).
+	const host = { ...f.pi, registerProvider(id: any, config: any) {
+		wrapped = config.streamSimple;
+		const forwarding = (m: any, c: any, o: any) => wrapped(m, c, o);
+		f.pi.registerProvider(id, { ...config, streamSimple: Object.assign(forwarding, { [RECOVERY_INNER_STREAM]: wrapped }) });
+	} };
+	const pi = recoveryProviderAPI(host as any, () => { throw new Error("guarded"); }, f.coverage);
+	pi.registerProvider("owned", { api: "owned-api" } as any);
+	assert.equal(hasRecoveryAdmission(f.registry, model, f.coverage), true);
+	delete f.configs.get("owned").streamSimple[RECOVERY_INNER_STREAM];
 	assert.equal(hasRecoveryAdmission(f.registry, model, f.coverage), false);
 });

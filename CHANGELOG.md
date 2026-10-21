@@ -17,6 +17,8 @@ Fork changes on top of upstream 1.26.0.
 
 - Optional fail-closed Codex compaction delegate (`codexCompaction`).
 
+- A host extension that wraps this package's provider registration can keep a slot an admitted context-recovery destination by naming the owned stream it forwards to under `Symbol.for("pi-multi-account.recovery-inner-stream")`. Without it, the Codex compaction delegate's transport made smaller-window Codex slots unusable as failover targets during recovery.
+
 ### Fixed
 
 - Explicit `anthropic-account-1` is available in `/login` before authentication and remains registered after restart. Slot discovery previously converted index 1 to the bare `anthropic` provider and skipped its registration, so a stored first numbered account had no transport. Both numbered Claude subscriptions now rotate without requiring a base credential.

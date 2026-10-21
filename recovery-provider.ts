@@ -6,11 +6,16 @@ export interface RecoveryProviderCoverage {
 	streamSimple: unknown;
 	native: boolean;
 }
+
+/** A host extension that wraps our registration names the owned stream its simple-stream calls go through. */
+export const RECOVERY_INNER_STREAM = Symbol.for("pi-multi-account.recovery-inner-stream");
+
 export function hasRecoveryAdmission(registry: any, model: any, coverage: Map<string, RecoveryProviderCoverage>): boolean {
 	const proof = coverage.get(model?.provider);
 	if (!proof?.apis.has(model?.api) || typeof proof.streamSimple !== "function") return false;
 	const extension = registry?.getRegisteredProviderConfig?.(model.provider);
-	if (extension?.streamSimple && extension.api === model.api) return extension.streamSimple === proof.streamSimple;
+	if (extension?.streamSimple && extension.api === model.api)
+		return extension.streamSimple === proof.streamSimple || extension.streamSimple[RECOVERY_INNER_STREAM] === proof.streamSimple;
 	return proof.native && registry?.getRegisteredNativeProvider?.(model.provider)?.streamSimple === proof.streamSimple;
 }
 
