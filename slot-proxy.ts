@@ -37,6 +37,14 @@
 export const PROXY_PLACEHOLDER_KEY = "pi-multi-account-proxy";
 
 /**
+ * Non-secret Anthropic placeholder with the shape Pi's native transport recognizes as OAuth.
+ * Request identity, tool-name conversion and response mapping all depend on this marker; adding
+ * a Bearer header at the proxy is too late. The proxy replaces it with the real token on egress.
+ * The legacy generic placeholder remains recognizable for restoration during an upgrade.
+ */
+export const ANTHROPIC_PROXY_PLACEHOLDER_KEY = "sk-ant-oat01-pi-multi-account-proxy";
+
+/**
  * The `apiKey` published for a **Codex** slot.
  *
  * Pi's Codex API does not merely pass the key along: before any request it splits it on `.`,
@@ -60,12 +68,23 @@ export const PROXY_PLACEHOLDER_JWT = [
 	"",
 ].join(".");
 
-/** Either published placeholder — neither is a credential, both mark "a child we published for". */
+/** Current or legacy published placeholder — none is a real credential. */
 export function isPublishedPlaceholder(value: string | undefined): boolean {
-	return value === PROXY_PLACEHOLDER_KEY || value === PROXY_PLACEHOLDER_JWT;
+	return value === PROXY_PLACEHOLDER_KEY || value === PROXY_PLACEHOLDER_JWT ||
+		value === ANTHROPIC_PROXY_PLACEHOLDER_KEY;
 }
 
-export type ProxyFamily = "anthropic" | "codex";
+/** Native Sign in with ChatGPT rejects these metered-API request fields. */
+export function shapeOpenAIChatGPTPayload(payload: unknown): Record<string, unknown> {
+	if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+		throw new Error("A native ChatGPT Responses request must be a JSON object");
+	}
+	const shaped = { ...payload } as Record<string, unknown>;
+	for (const field of ["max_output_tokens", "temperature", "prompt_cache_retention", "prompt_cache_options"]) delete shaped[field];
+	return shaped;
+}
+
+export type ProxyFamily = "anthropic" | "codex" | "openai";
 
 /**
  * Which family, if any, this parent-owned loopback can serve.
@@ -79,6 +98,7 @@ export type ProxyFamily = "anthropic" | "codex";
 export function proxyFamilyFor(slotId: string): ProxyFamily | undefined {
 	if (slotId === "anthropic" || /^anthropic-account-\d+$/.test(slotId)) return "anthropic";
 	if (/^openai-codex-account-\d+$/.test(slotId)) return "codex";
+	if (/^openai-account-\d+$/.test(slotId)) return "openai";
 	return undefined;
 }
 
@@ -91,6 +111,7 @@ export function needsChildFacingApiKey(slotId: string): boolean {
 export const UPSTREAM_BASE: Readonly<Record<ProxyFamily, string>> = Object.freeze({
 	anthropic: "https://api.anthropic.com",
 	codex: "https://chatgpt.com/backend-api",
+	openai: "https://api.openai.com",
 });
 
 export interface ProxyRoute {
@@ -101,8 +122,11 @@ export interface ProxyRoute {
 export interface ProxyCredential {
 	type?: string;
 	access?: string;
+	refresh?: string;
 	key?: string;
 	accountId?: string;
+	clientId?: string;
+	scopes?: string[];
 }
 
 /**
@@ -232,6 +256,18 @@ export function shapeUpstreamRequest(args: {
 		};
 	}
 
+	if (route.family === "openai") {
+		// Subscription aliases serve only native Responses, never legacy quota,
+		// classifier/image-generation endpoints or a stored/ambient metered key.
+		if (!/^\/v1\/responses(?:\/[A-Za-z0-9_-]+(?:\/cancel)?)?$/.test(rest)) {
+			return { ok: false, status: 404, message: "this subscription route serves native Responses only" };
+		}
+		if (credential.type !== "oauth" || !credential.access || !credential.refresh ||
+			!credential.clientId || !credential.scopes?.includes("chatgpt.tokens.use.direct")) {
+			return { ok: false, status: 401, message: "no native direct-token ChatGPT grant held for this subscription route" };
+		}
+	}
+
 	const headers: Record<string, string> = {};
 	for (const [name, value] of Object.entries(args.headers)) {
 		const lower = name.toLowerCase();
@@ -273,7 +309,20 @@ export function shapeUpstreamRequest(args: {
 		}
 	}
 
-	return { ok: true, url: `${base}${rest}`, headers };
+	if (route.family === "openai") {
+		// Codex's routing identity belongs to its other backend, not this grant.
+		delete headers["chatgpt-account-id"];
+		delete headers.originator;
+	}
+
+	// Image tools append these endpoints directly to the slot base; chat already sends /codex.
+	// Leave all other paths and families intact, including usage requests.
+	const upstreamRest =
+		route.family === "codex" && /^\/images\/(?:generations|edits)(?:\?.*)?$/.test(rest)
+			? `/codex${rest}`
+			: rest;
+
+	return { ok: true, url: `${base}${upstreamRest}`, headers };
 }
 
 /** Keep any beta flags the caller asked for, and add ours once. */
@@ -289,7 +338,14 @@ function mergeBeta(existing: string | undefined, required: string): string {
 
 /** The `apiKey` to publish for a slot of this family. */
 export function placeholderKeyFor(family: ProxyFamily): string {
-	return family === "codex" ? PROXY_PLACEHOLDER_JWT : PROXY_PLACEHOLDER_KEY;
+	return family === "codex" ? PROXY_PLACEHOLDER_JWT :
+		family === "anthropic" ? ANTHROPIC_PROXY_PLACEHOLDER_KEY : PROXY_PLACEHOLDER_KEY;
+}
+
+/** Recognize the previous Anthropic publication without mistaking real tokens for placeholders. */
+export function isPlaceholderFor(family: ProxyFamily, value: unknown): boolean {
+	return value === placeholderKeyFor(family) ||
+		(family === "anthropic" && value === PROXY_PLACEHOLDER_KEY);
 }
 
 /** The `models.json` route to publish for a slot served by this proxy. */
@@ -305,7 +361,7 @@ export function isOwnLoopbackPublication(
 	if (!existing || typeof existing !== "object") return false;
 	const rec = existing as Record<string, unknown>;
 	return (
-		rec.apiKey === placeholderKeyFor(family) &&
+		isPlaceholderFor(family, rec.apiKey) &&
 		typeof rec.baseUrl === "string" &&
 		rec.baseUrl.startsWith("http://127.0.0.1:")
 	);

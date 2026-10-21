@@ -7,29 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### Compatibility
-
-- Requires Pi >=0.87.1; tested with 0.87.1 and 1.0.4. The OAuth/catalog bridge now installs pi-ai 1.0.x.
+Fork changes on top of upstream 1.26.0.
 
 ### Added
 
-- Claude Sonnet 5.5 (`claude-sonnet-5-5`): Anthropic documents it for on-demand compaction, so native compaction now covers it. The OAuth billing header floor (`CLAUDE_CODE_VERSION`) is now 2.1.284, the first Claude Code release that serves Sonnet 5.5.
+- Claude Sonnet 5.5 (`claude-sonnet-5-5`): Anthropic documents it for on-demand compaction, so native compaction now covers it.
 
-- Optional Anthropic native compaction (`anthropicNativeCompaction: true`, adapted from pi-anthropic-compat). On direct Claude API slots with a documented model, compaction asks Anthropic for a signed summary (`compact-2026-09-04`); its plain text becomes the entry summary, so other models and accounts keep reading ordinary text, and later requests from the same slot and model replay the signed block ahead of subscription shaping. It runs under the same conditions as the Codex delegate (automatic failover on, provider not exempt). Any failure warns with a fixed reason and continues with the existing compaction path; a failed module load disables the feature instead of affecting requests. Off by default.
+- Optional Anthropic native compaction (`anthropicNativeCompaction: true`, adapted from pi-anthropic-compat). On direct Claude API slots with a documented model, compaction asks Anthropic for a signed summary (`compact-2026-09-04`); its plain text becomes the entry summary, so other models and accounts keep reading ordinary text, and later requests from the same slot and model replay the signed block. Context recovery still owns compaction when the current account is not ready.
+
+- Optional fail-closed Codex compaction delegate (`codexCompaction`).
 
 ### Fixed
 
 - Explicit `anthropic-account-1` is available in `/login` before authentication and remains registered after restart. Slot discovery previously converted index 1 to the bare `anthropic` provider and skipped its registration, so a stored first numbered account had no transport. Both numbered Claude subscriptions now rotate without requiring a base credential.
 
-- `/multi-account remove` and `/multi-account clear` work again on Pi >=0.87, which no longer exposes its AuthStorage to extensions. Removal failed with "credential deletion failed" and left the account in place. It now deletes the one entry under Pi's cross-process `auth.json` lock, re-reading the file so a concurrent login or refresh is kept.
-
 - Numbered Claude slots keep Pi's registry metadata for a model only Pi's remote catalog knows, such as `claude-sonnet-5-5` before pi-ai ships it. Re-registering the slots at session start previously replaced it with a 200K-context, 32K-output placeholder with no thinking levels or compat flags.
 
-- Pi starts about 0.13s faster. Numbered Claude and Kimi slots now read model metadata from the host's already-loaded pi-ai when Pi's extension loader provides it, instead of loading this package's own pi-ai and its whole provider catalog again. Other hosts keep the previous lookup.
+- Forced OAuth refreshes also run on Pi hosts that expose no AuthStorage to extensions (Pi 0.87 and later). Upstream reports them unsupported there; the fork admits the transaction through Pi's own cross-process `auth.json` lock instead, then uses upstream's fenced refresh transaction. A host that exposes a store without `modify()` is still refused.
 
-- Forced Anthropic and Codex OAuth refreshes (usage-poll 401s, auth-error recovery, slot proxy) now spend the one-use refresh token under Pi's cross-process `auth.json` lock. Pi 0.87 no longer exposes its AuthStorage to extensions, so the Codex lock added in 1.22.0 was silently skipped and Anthropic never had one; the extension now takes the same `proper-lockfile` lock Pi core uses. Previously every idle Pi window raced for the same token when the 8h Anthropic access token expired, which could burn the live credential and force a manual `/login` roughly once a day. A window that loses the race now adopts the rotated token instead of sending the spent one. The lock also refreshes its timestamp every 5 s so Pi's own synchronous lock path (10 s staleness) cannot break it mid-refresh. Pi windows started before this update keep refreshing without the lock until they are restarted.
+- The Anthropic OAuth billing header reports the locally installed Claude Code (`claude --version`) when it is newer than `CLAUDE_CODE_VERSION`, so a pinned install keeps working when a new model requires a newer client. Set `PI_MULTI_ACCOUNT_DETECT_CLAUDE_CODE_VERSION=0` to use only the constant.
 
-- The Anthropic OAuth billing header now reports the locally installed Claude Code (`claude --version`) when it is newer than `CLAUDE_CODE_VERSION`, so a pinned install keeps working when a new model requires a newer client (Opus 5.5 rejected 2.1.274). Set `PI_MULTI_ACCOUNT_DETECT_CLAUDE_CODE_VERSION=0` to use only the constant.
+## [1.26.0] — 2026-10-19
+
+### Context recovery
+
+- Add source-preserving, bounded recovery for smaller-window managed fallbacks on canonical-projection hosts, without enabling the optional proactive context guard.
+- Reject oversized transition payloads at owned provider boundaries, prepare a checkpoint in read-only passes, and let native compaction commit/retry the original task.
+- Add scoped, paginated history retrieval and native-journal archive restoration. Private thinking/signatures are excluded; invalid or stale preparation never commits a partial checkpoint.
+- Document byte-budget limits, unsupported destinations, cancellation and evidence limitations in `docs/context-recovery.md`.
+
+## [1.25.0] — 2026-10-19
+
+### Context policy migration
+
+- Make `contextGuard` explicit opt-in (#95). Missing, null, false and invalid values no longer trim tool results or request guard-driven summaries; Pi owns normal compaction timing. Existing explicit `true` or object settings remain unchanged: remove `contextGuard` or set it to `false` to opt out. Account failover and summary-account routing are unaffected.
+- Preserve native sparse reasoning-map semantics on aliases and restricted children. Only known catalog allowlists acquire explicit denials; omitted native `medium`/`high` entries remain supported.
+- Add a provider-only Codex adapter for explicitly selected restricted maintenance children, without parent account rotation, credential copying or ambient paid-key fallback. Recover expired-access-token failures through available same-model siblings when the host exposes no transactional refresh API.
+- Declare host-provided SDK packages as wildcard peers as required by Pi's extension loader; compatibility is verified independently by CI.
+
+### Added
+
+- Native new OpenAI ChatGPT OAuth accounts (#92) on hosts exposing the public native Provider contract (tested on Pi 0.99.2, 1.0.0 and 1.1.0): distinct `openai-account-N` login/discovery, host-owned device UUID and issued client/scopes, native Responses chat catalogs, model pins/quality/effort and guarded refresh. `add openai` selects this family; `add codex` remains legacy. Older supported hosts remain loadable but do not advertise new OAuth support; no legacy credential migration or runtime upgrade.
+- Separate parent-owned Responses child routes with non-secret placeholders, native image input/tool streaming and result replay, caller cancellation and exact recovery/teardown. New aliases refuse stored/ambient paid keys; crossing to base OpenAI metered access requires an explicit fallback target. Auth derivation binds the endpoint and rejects incompatible host-model composition before bearer dispatch; alias/proxy payload shaping preserves native subscription field restrictions. Direct-grant quota remains unknown and never uses legacy Codex endpoints. Fresh native-host/offline-child tests prove mechanism behavior, not live provider login or availability.
+
+### Fixed
+
+- Persist actual inference-refusal evidence across aliases and restarts. Positive quota metadata cannot erase the refusal during bounded retry backoff; provider reset estimates and next recheck times are distinct. A completed, non-error inference clears the evidence; HTTP 200 at stream start, OAuth refresh and absent completion markers do not.
+- Preserve newer sibling refusal/cooldown records from stale shared-state deletion or shortening. Coupled weekly exhaustion wins over short-window headroom; Cursor's independent pools retain their existing semantics.
+- Codex usage parsing keeps explicit availability verdicts without windows and treats an explicit negative as authoritative when flags conflict.
+- Status, all-account waiting and continuation messages distinguish eligibility from verified availability and use the actual failure reason. Interrupted handoffs are optional bounded context, not promised durable verbatim receipts; missing results retain unknown-effect status. Exact shipped legacy defaults migrate in memory without rewriting custom prompts.
+- Backport and strengthen the Anthropic refresh transaction pattern discussed in #90: all extension-owned forced refresh families now use one cross-process credential transaction, preserve numbered-slot sidecars/placeholders, and never fall through to blind writes. Without a transactional host API, decline before spending the token.
+- Classify the known Grok 4.7 flagship as frontier (#91), without guessing future 4.x quality or treating `fast` / `non-reasoning` variants as equivalent.
+- Update the billing-header Claude Code version to the registry-observed 2.1.296 (#89), rather than the tracker's already stale 2.1.289 proposal.
+
+- Fence forced-refresh auth/sidecar commits on actual lease identity, cancellation and unchanged disk state; stage sidecar outputs until joined refresh work settles. Use a fast heartbeat compatible with older synchronous host writers, and propagate Cursor cancellation through fetch and body consumption. A lost lease never removes its replacement or grants stale-write authority, including immediate process exit; async leases avoid library-global exit unlink and contention waits within the cancellation budget.
+- Preserve upstream 1.24.0 model pins, host-native Anthropic placeholders, opaque-token proxy refresh and Codex image routing while integrating the local Cursor/compaction and quota-recovery repairs.
+
+### Security
+
+- Remediate Dependabot #13 (`GHSA-q2hr-2g5m-vwhr`) by using the matched **1.1.0 development SDK pair**, whose published package no longer carries the vulnerable old shrinkwrap, and resolving/installing `brace-expansion` **5.0.12**. This changes development fixtures, not the user's installed Pi runtime; legacy hosts remain compatibility targets. The advisory checker verifies lock and actual installed versions. No foreign `node_modules` mutation, postinstall patch or security-alert dismissal is used.
+
+### Compatibility
+
+- Include Pi **1.1.0** in the native host test matrix. New `openai` ChatGPT multi-account support is separately capability-gated; setup, billing isolation, unknown usage and deterministic acceptance are documented in `docs/openai-chatgpt-accounts.md`. Legacy Codex credentials and aliases are not migrated.
+
+
+## [1.24.0] — 2026-10-03
+
+### Added
+
+- Explicit `/multi-account pin provider/model`, `unpin provider-or-family` and `pins [list]` controls (#74). Pins persist one preference per account group across reload/restart, without changing Pi's foreground model, shared registry or startup defaults. Exact siblings, account availability and automatic quality bands still win; missing models remain saved but inactive. All extension config commands share locked field-scoped persistence, preserving concurrent unrelated settings. Pins reject busy, passive-child, closed or stale sessions and cannot authorize cheaper provider-only switching or automatic compaction. Thanks @MarsLuay for the feature request.
+
+### Fixed
+
+- Refresh expired opaque Anthropic OAuth tokens from their stored expiry before proxy forwarding, including seconds/milliseconds and flight slack; the newly persisted token reaches upstream (#79, thanks @unclejobs-ai).
+- Numbered Anthropic OAuth slots publish a non-secret OAuth-shaped placeholder so Pi retains native Claude identity, `x-app: cli`, tool-name serialization and response mapping (#80). Real credentials stay parent-side. Sidecar-backed legacy publications migrate safely; production refresh writes privately under the auth lock without briefly unshadowing a child. API-key aliases remain direct and real API keys are not rewritten. Parent/native and real `pi --no-extensions` tool roundtrips run against deterministic fake upstreams. A disconnected proxy caller aborts its upstream request without poisoning provider health. These tests do not claim live Anthropic acceptance.
+- Normalize only Codex `/images/generations` and `/images/edits` routes by adding exactly one `/codex` segment, preserving queries and leaving chat, usage, authentication and similar paths unchanged (#83, thanks @hantusk). Live image-service success remains outside the deterministic routing guarantee.
+- Update the Anthropic billing-header Claude Code version to **2.1.288**, the current registry version at release preparation (#81).
+
+### Compatibility
+
+- Bind OAuth, catalogs and transports to the running host's public SDK surfaces, including Pi **0.99.2 and 1.0.0** alongside **0.85.1, 0.86.1 and 0.87.1** (#82, thanks @zieglar). Both SDKs are host peers; a private runtime SDK is no longer required for the factory bridge. Pi 0.99+ requires Node >=22.19.0.
+- Pi-owned virtual selections and configured image/classifier models remain host-owned and never become account chat fallback targets. Modern transcript/context conversion preserves system instructions, tools and streamed tool results.
+- Replace the split SDK updates in #84/#87 with a matched development pair at **0.87.1** and a regenerated lockfile. Update protobuf to **2.15.0** (#85) and Node types to **22.20.4** (#86). Thanks to Dependabot for the dependency updates.
 
 ## [1.23.2] — 2026-09-24
 
