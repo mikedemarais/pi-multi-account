@@ -23,7 +23,7 @@ Fork changes on top of upstream 1.26.0.
 
 - Numbered Claude slots keep Pi's registry metadata for a model only Pi's remote catalog knows, such as `claude-sonnet-5-5` before pi-ai ships it. Re-registering the slots at session start previously replaced it with a 200K-context, 32K-output placeholder with no thinking levels or compat flags.
 
-- Forced OAuth refreshes also run on Pi hosts that expose no AuthStorage to extensions (Pi 0.87 and later). Upstream reports them unsupported there; the fork admits the transaction through Pi's own cross-process `auth.json` lock instead, then uses upstream's fenced refresh transaction. A host that exposes a store without `modify()` is still refused.
+- Forced OAuth refreshes also run on Pi hosts that expose no AuthStorage to extensions (Pi 0.87 and later). Upstream reports them unsupported there; the fork runs upstream's fenced `auth.json` refresh transaction directly when that file is writable. A host that exposes a store without `modify()` is still refused.
 
 - The Anthropic OAuth billing header reports the locally installed Claude Code (`claude --version`) when it is newer than `CLAUDE_CODE_VERSION`, so a pinned install keeps working when a new model requires a newer client. Set `PI_MULTI_ACCOUNT_DETECT_CLAUDE_CODE_VERSION=0` to use only the constant.
 

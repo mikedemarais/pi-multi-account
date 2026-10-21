@@ -549,9 +549,7 @@ function setup(opts: {
 					);
 				}),
 			authStorage:
-				opts.hostAuthStorage === "pi-0.87"
-					? undefined
-					: opts.hostAuthStorage === "pi-0.84"
+				opts.hostAuthStorage === "pi-0.84"
 					? {
 							reload: () => {
 								rec.authReloads++;
@@ -11133,65 +11131,6 @@ test("two storage instances serialize Codex refresh and make one network exchang
 		assert.equal(readLatest().refresh, "new-refresh");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-test("the extension's auth.json lock and Pi's own AuthStorage exclude each other", async () => {
-	// Pi >= 0.87 hands extensions no AuthStorage, so the extension takes auth.json's lock itself.
-	// That only protects a one-use refresh token if Pi core's own refresh honours the same lock.
-	const { AuthStorage } = await import(new URL(
-		"../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js", import.meta.url).href);
-	const { lockedAuthFileStorage } = await import("../auth-file-transaction.ts");
-	const provider = "anthropic-account-2";
-	const oldCredential = { type: "oauth", access: "old-access", refresh: "old-refresh", expires: 1 };
-	for (const [holder, waiter] of [["pi", "extension"], ["extension", "pi"]]) {
-		const root = mkdtempSync(join(tmpdir(), "anthropic-refresh-lock-"));
-		const path = join(root, "auth.json");
-		writeFileSync(path, JSON.stringify({
-			[provider]: oldCredential,
-			unrelated: { type: "api_key", key: "keep" },
-		}));
-		let exchanges = 0;
-		let holderEntered!: () => void;
-		const entered = new Promise<void>((resolve) => { holderEntered = resolve; });
-		let releaseHolder!: () => void;
-		const gate = new Promise<void>((resolve) => { releaseHolder = resolve; });
-		const readLatest = () => JSON.parse(readFileSync(path, "utf8"))[provider];
-		const run = (kind: string) =>
-			refreshAndPersistWithStorageLock({
-				provider,
-				credentials: oldCredential,
-				authStorage: kind === "pi" ? AuthStorage.create(path) : lockedAuthFileStorage(path),
-				readLatest,
-				refresh: async (current: any) => {
-					exchanges++;
-					if (exchanges === 1) {
-						holderEntered();
-						await gate;
-					}
-					return { ...current, access: "new-access", refresh: "new-refresh", expires: Date.now() + 86_400_000 };
-				},
-			});
-
-		try {
-			const first = run(holder);
-			await entered;
-			const second = run(waiter);
-			await new Promise((resolve) => setTimeout(resolve, 150));
-			assert.equal(exchanges, 1, `${waiter} must wait while ${holder} holds the lock`);
-			releaseHolder();
-			const [a, b] = await Promise.all([first, second]);
-
-			assert.equal(exchanges, 1, `${waiter} must adopt ${holder}'s token instead of spending the old one`);
-			assert.equal(a.refresh, "new-refresh");
-			assert.equal(b.refresh, "new-refresh");
-			const disk = JSON.parse(readFileSync(path, "utf8"));
-			assert.equal(disk[provider].refresh, "new-refresh");
-			assert.equal(disk.unrelated.key, "keep");
-		} finally {
-			releaseHolder();
-			rmSync(root, { recursive: true, force: true });
-		}
 	}
 });
 

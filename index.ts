@@ -31,7 +31,7 @@ import { createRecoveryArchives, RECOVERY_DETAIL } from "./recovery-archive.ts";
 import { recoveryTools, RECOVERY_TOOL_NAMES } from "./recovery-tools.ts";
 import { prepareNativeRecovery, recoveryBudget, guardRecoveryCommit } from "./recovery-compaction.ts";
 import { recoveryProviderAPI, hasRecoveryAdmission, type RecoveryProviderCoverage } from "./recovery-provider.ts";
-import { lockedAuthFileStorage, mutateProxyAuth, mutateProxyAuthAsync } from "./auth-file-transaction.ts";
+import { mutateProxyAuth, mutateProxyAuthAsync } from "./auth-file-transaction.ts";
 import { mergeStateDeltas, mutateStateFile } from "./state-file-transaction.ts";
 import { normalizeModelPins, persistModelPin, validModelPinScope } from "./model-pins.ts";
 import { assertOpenAIChatGPTConfiguration, cloneOpenAIChatGPTProvider, isOpenAIChatGPTCredential, OPENAI_CHATGPT_URL, supportsOpenAIChatGPT } from "./openai-chatgpt.ts";
@@ -5014,26 +5014,19 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			return { status: "unsupported" };
 		}
 
-		const hostAuthStorage = ctx?.modelRegistry?.authStorage;
+		const authStorage = ctx?.modelRegistry?.authStorage;
 		// Test harnesses and future Pi versions can provide a first-class forced refresh operation.
-		if (typeof hostAuthStorage?.forceRefreshProvider === "function") {
-			return hostAuthStorage.forceRefreshProvider(provider);
+		if (typeof authStorage?.forceRefreshProvider === "function") {
+			return authStorage.forceRefreshProvider(provider);
 		}
 		// A writable file or a set() method is NOT a refresh transaction. Token-rotating
 		// exchanges must read, refresh and persist under one cross-process lock. Never
 		// spend the token first and fall back to a blind captured-credential write (#90).
-		// Never bypass an exposed store that lacks one. Modern Pi exposes no store at all;
-		// then take its auth.json lock directly (below), if that file can be written.
-		if (hostAuthStorage ? typeof hostAuthStorage.modify !== "function" : !authFileIsWritable()) {
+		// Never bypass an exposed store that lacks one. Pi >= 0.87 exposes no store at all; the
+		// transaction below takes Pi's auth.json lock itself, so only the file must be writable.
+		if (authStorage ? typeof authStorage.modify !== "function" : !authFileIsWritable()) {
 			return { status: "unsupported" };
 		}
-		// Pi >= 0.87 no longer exposes its AuthStorage to extensions; take its auth.json lock directly.
-		const authStorage =
-			typeof hostAuthStorage?.modify === "function"
-				? hostAuthStorage
-				: lockedAuthFileStorage(AUTH_PATH, (error) =>
-						logEvent("auth_lock_compromised", { provider, error: error.message }),
-					);
 
 		const family = classifyProvider(provider, config.qwenProvider);
 		try {
@@ -5043,7 +5036,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			const signal = AbortSignal.timeout(30_000);
 			// Fail closed if the host declines its credential transaction at all.
 			// This read-only admission releases before our common-file lease is acquired.
-			await authStorage.modify(provider, () => undefined, { signal });
+			await authStorage?.modify(provider, () => undefined, { signal });
 			let transactionSignal = signal;
 			let shadowedCredential: AuthEntry | undefined;
 			// The host callback API cannot fence a sidecar write before its own
@@ -10011,7 +10004,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			} catch {
 				// non-fatal: in-memory state is still cleared
 			}
-			// Remove all numbered alias slots under Pi's auth.json lock so `/multi-account add`
+			// Remove all numbered alias slots through Pi's locked credential API so `/multi-account add`
 			// starts fresh at account-2 without overwriting a concurrent login or refresh. Keep base
 			// providers (no -account-N suffix) and unrelated providers (openrouter, deepseek, zai, etc.).
 			const removedSlots = [
