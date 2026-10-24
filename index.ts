@@ -100,6 +100,7 @@ import {
 	describeContractDrift,
 	observedAssumptions,
 	piAutoPersistsSelectedModel,
+	piHasFullTranscriptContext,
 	type ShapeVerdict,
 } from "./pi-contract.ts";
 import {
@@ -3993,6 +3994,8 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	const oauthUnavailable = piAiOauthUnavailableReason();
 	// Lazy: the module imports Pi's convertToLlm, which nothing else here needs. A load failure
 	// disables the feature instead of failing every provider request and compaction.
+	/** The last foreground request's full transcript, captured in context_with_system (Pi >= 0.87). */
+	let lastTranscript: { model: string; messages: any[] } | undefined;
 	const anthropicCompaction = options.anthropicNativeCompaction
 		? import("./anthropic-compaction.ts").catch((error) => { reportExtensionError("anthropic compaction load", error); return undefined; })
 		: undefined;
@@ -8028,7 +8031,8 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		if (!native?.eligible(ctx.model)) return undefined;
 		try {
 			const active = new Set(pi.getActiveTools());
-			return await native.nativeCompaction(event, ctx, pi.getAllTools().filter((tool) => active.has(tool.name)));
+			const transcript = lastTranscript?.model === `${ctx.model?.provider}/${ctx.model?.id}` ? lastTranscript.messages : undefined;
+			return await native.nativeCompaction(event, ctx, pi.getAllTools().filter((tool) => active.has(tool.name)), fetch, transcript);
 		} catch (error) {
 			if (event?.signal?.aborted) return { cancel: true as const };
 			// Reasons are fixed strings or HTTP statuses; provider bodies are never surfaced.
@@ -10706,18 +10710,31 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	// `user` record is what lets the account we failed over TO see where the previous one
 	// actually stopped, instead of being told "don't repeat completed work" with no record
 	// of that work. See preserveInterruptedTurns() for the full rationale.
-	safeOn("context", (event: any) => {
+	const preserveInterrupted = (messages: unknown) => {
 		if (!automaticFailoverEnabled() || !config.preserveInterruptedContext) return undefined;
-		const messages = event?.messages;
 		if (!Array.isArray(messages) || messages.length === 0) return undefined;
 		const preserved = preserveInterruptedTurns(messages);
 		if (preserved === messages) return undefined;
-		const rescued = messages.length - preserved.length;
 		logEvent("interrupted_context_preserved", {
 			messages: messages.length,
-			folded: rescued,
+			folded: messages.length - preserved.length,
 		});
-		return { messages: preserved };
+		return preserved;
+	};
+	// A changed `context` result folds mid-conversation system messages (tool changes) into the
+	// leading one and rewrites the cached prefix, so hosts with the full-transcript event use it.
+	const fullTranscriptContext = piHasFullTranscriptContext(PI_HOST_VERSION);
+	safeOn("context", (event: any) => {
+		if (fullTranscriptContext) return undefined;
+		const preserved = preserveInterrupted(event?.messages);
+		return preserved ? { messages: preserved } : undefined;
+	});
+	safeOn("context_with_system", (event: any, ctx: any) => {
+		const preserved = preserveInterrupted(event?.messages);
+		const messages = preserved ?? event?.messages;
+		// The foreground request as sent, so a summary request can repeat it from the prompt cache.
+		if (Array.isArray(messages) && ctx?.model) lastTranscript = { model: `${ctx.model.provider}/${ctx.model.id}`, messages: [...messages] };
+		return preserved ? { messages: preserved } : undefined;
 	});
 
 	// ---- mid-run context guard --------------------------------------------

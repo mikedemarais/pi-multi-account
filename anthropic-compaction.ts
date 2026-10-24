@@ -139,11 +139,30 @@ export function parseSummary(response: Json, modelId: string) {
 }
 
 /**
+ * The last foreground request's transcript (system messages included) up to the end of the
+ * summarized range. A summary request built from it repeats that request byte for byte up
+ * to the cut, so Anthropic reads it from the prompt cache instead of writing it again.
+ * Undefined when the transcript does not reach exactly the last summarized message.
+ */
+export function cachedHistory(transcript: readonly any[] | undefined, history: readonly any[]): any[] | undefined {
+	const last = history.at(-1);
+	if (!last || transcript?.[0]?.role !== "system") return undefined;
+	let at = transcript.length - 1;
+	while (at >= 0 && !(transcript[at]?.role === last.role && transcript[at]?.timestamp === last.timestamp)) at--;
+	if (at < 0) return undefined;
+	const prefix = transcript.slice(0, at + 1);
+	// Byte for byte the summarized messages, else the summary would cover something else.
+	const tail = prefix.filter((message) => message?.role !== "system").slice(-history.length);
+	return tail.length === history.length && tail.every((message, index) => JSON.stringify(message) === JSON.stringify(history[index])) ? prefix : undefined;
+}
+
+/**
  * Summarize `preparation`'s discarded range natively. Throws on any failure; the caller
  * falls back to Pi's text compaction. The request is serialized by the provider slot's own
  * transport (auth, subscription shaping, cache markers) and captured before transmission.
  */
-export async function nativeCompaction(event: SessionBeforeCompactEvent, ctx: ExtensionContext, tools: unknown[], fetcher: typeof fetch = fetch) {
+export async function nativeCompaction(event: SessionBeforeCompactEvent, ctx: ExtensionContext, tools: unknown[], fetcher: typeof fetch = fetch,
+	transcript?: readonly any[]) {
 	const model = ctx.model as unknown as Model;
 	if (!eligible(model)) throw new Error("model not eligible");
 	const signal = AbortSignal.any([event.signal, AbortSignal.timeout(TIMEOUT_MS)]);
@@ -156,16 +175,20 @@ export async function nativeCompaction(event: SessionBeforeCompactEvent, ctx: Ex
 	// A compatible prior checkpoint continues natively; otherwise the prior summary is text.
 	const lead = !prior && preparation.previousSummary
 		? [{ role: "compactionSummary", summary: preparation.previousSummary, tokensBefore: 0, timestamp: 0 } as any] : [];
+	// The live transcript carries the prompt, tool changes and any earlier summary exactly as sent;
+	// rebuilding them from parts reorders tools and misses the cache from the first byte.
+	const cached = cachedHistory(transcript, history);
 	let captured: Request | undefined;
-	await ctx.modelRegistry.streamSimple(model as any, {
+	await ctx.modelRegistry.streamSimple(model as any, cached ? { messages: convertToLlm(cached) } : {
 		systemPrompt: ctx.getSystemPrompt(),
 		messages: convertToLlm([...lead, ...history]),
 		tools: tools as any,
 	}, {
 		signal, maxRetries: 0,
 		...(ctx.thinkingLevel && ctx.thinkingLevel !== "off" ? { reasoning: ctx.thinkingLevel } : {}),
-		// Runs before the slot's own shaping, so billing metadata covers the final messages.
-		onPayload: (payload: any) => prior ? { ...payload, messages: leadWith(payload.messages, prior.block) } : undefined,
+		// Runs before the slot's own shaping, so billing metadata covers the final messages. The cached
+		// transcript still holds the earlier summary, which the live requests replace the same way.
+		onPayload: (payload: any) => cached ? replay(payload, ctx) : prior ? { ...payload, messages: leadWith(payload.messages, prior.block) } : undefined,
 		fetch: async (input: any, init: any) => {
 			captured = new Request(input, init);
 			throw new Error("captured without transmission");

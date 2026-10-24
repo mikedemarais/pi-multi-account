@@ -21,6 +21,10 @@ Fork changes on top of upstream 1.26.0.
 
 ### Fixed
 
+- Anthropic native compaction reads the prompt cache. It now repeats the last foreground request's transcript (prompt, tool changes, earlier summary) up to the cut instead of rebuilding the prompt and tool list, which missed the cache from the first byte. In a live 160k-token Opus 5.5 session the summary request read 125k tokens from cache and wrote none; before, every native compaction wrote the whole range.
+
+- Preserving interrupted turns no longer rewrites the cached prefix on Pi 0.87+. A changed `context` result makes Pi fold every mid-conversation system message (tool additions and removals) into the leading one, so the rewrite now runs in `context_with_system`.
+
 - Explicit `anthropic-account-1` is available in `/login` before authentication and remains registered after restart. Slot discovery previously converted index 1 to the bare `anthropic` provider and skipped its registration, so a stored first numbered account had no transport. Both numbered Claude subscriptions now rotate without requiring a base credential.
 
 - Numbered Claude slots keep Pi's registry metadata for a model only Pi's remote catalog knows, such as `claude-sonnet-5-5` before pi-ai ships it. Re-registering the slots at session start previously replaced it with a 200K-context, 32K-output placeholder with no thinking levels or compat flags.

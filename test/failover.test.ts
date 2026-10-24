@@ -9405,13 +9405,15 @@ test("the turn that triggered the failover survives into the account that takes 
 	await t.fire("agent_end", { messages: [interrupted] });
 	assert.ok(t.rec.setModels.length > 0, "the account must actually have switched");
 
-	// The next request on the account we switched TO goes through the context hook.
-	const result = await t.fire("context", {
-		messages: [
-			{ role: "user", content: [{ type: "text", text: "migrate + seed" }], timestamp: 1 },
-			interrupted,
-		],
-	});
+	// The next request on the account we switched TO goes through the full-transcript hook.
+	// The plain `context` hook leaves it alone there: rewriting it would fold Pi's tool-change
+	// system messages into the leading one and rewrite the cached prompt prefix.
+	const system = { role: "system", content: "prompt", timestamp: 0 };
+	const late = { role: "system", content: "", toolsAdded: [{ name: "late" }], timestamp: 2 };
+	const messages = [system, { role: "user", content: [{ type: "text", text: "migrate + seed" }], timestamp: 1 }, late, interrupted];
+	assert.equal(await t.fire("context", { messages: messages.filter((m: any) => m.role !== "system") }), undefined);
+	const result = await t.fire("context_with_system", { messages });
+	assert.deepEqual(result?.messages.slice(0, 3), messages.slice(0, 3), "system messages stay where they were");
 	assert.ok(result?.messages, "the hook must rewrite the transcript");
 	assert.equal(
 		result.messages.some((m: any) => m.role === "assistant"),
@@ -9433,7 +9435,7 @@ test("preserveInterruptedContext: false restores the old drop-everything behavio
 		current: { provider: "openai-codex", id: "gpt-5.5" },
 		config: { autoDiscover: true, preserveInterruptedContext: false },
 	});
-	const result = await t.fire("context", {
+	const result = await t.fire("context_with_system", {
 		messages: [
 			{
 				role: "assistant",

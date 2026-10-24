@@ -123,3 +123,33 @@ test("native compaction throws (so Pi's summary runs) on HTTP errors, bad replie
 	await assert.rejects(nativeCompaction(event, ctx, [], async () => { ctx.sessionManager.appendMessage({ role: "user", content: "y", timestamp: 6 }); return reply(); }), /session changed/);
 	await assert.rejects(nativeCompaction(event, { ...ctx, model: { ...slot, id: "claude-haiku-4-5" } }, [], async () => reply()), /not eligible/);
 });
+
+test("with the live transcript, native compaction repeats that request up to the cut, so it reads the cache", async () => {
+	const { ctx, sm, kept } = session();
+	const tools = [{ name: "lookup", description: "Synthetic", parameters: { type: "object", properties: {} } }];
+	const history = sm.buildSessionContext().messages; // the earlier summary, then two messages to summarize now
+	const transcript = [{ role: "system", content: "SYSTEM", toolsAdded: tools, timestamp: 0 }, ...history,
+		{ role: "system", content: "", toolsAdded: [{ ...tools[0], name: "late" }], timestamp: 4 },
+		{ role: "user", content: "keep me", timestamp: 9 }];
+	const capture = async (send: (fetch: any) => Promise<unknown>) => {
+		let body: any;
+		await send(async (_url: any, init: any) => { body = JSON.parse(init.body); return reply(); }).catch(() => {});
+		// Cache markers move to each request's last block; a string is the same tokens as one text block.
+		const blocks = (key: string, value: any) => key === "cache_control" ? undefined
+			: key === "content" && typeof value === "string" ? [{ type: "text", text: value }] : value;
+		return JSON.parse(JSON.stringify(body, blocks));
+	};
+	const live = await capture((fetch) => streamSimple(ctx.model, { messages: convertToLlm(transcript as any) },
+		{ apiKey: "sk-ant-api-test", maxRetries: 0, reasoning: "high", onPayload: (payload: any) => replay(payload, ctx), fetch } as any).result());
+	const event: any = { signal: new AbortController().signal, preparation: { firstKeptEntryId: kept, tokensBefore: 1, previousSummary: "SIGNED SUMMARY",
+		settings: { reserveTokens: 16_384 }, messagesToSummarize: history.slice(1), turnPrefixMessages: [] } };
+	const summary = await capture((fetch) => nativeCompaction(event, ctx, [], fetch, transcript));
+	assert.deepEqual(summary.system, live.system);
+	assert.deepEqual(summary.tools, live.tools, "tools as declared by the live request, not rebuilt");
+	const prefix = summary.messages.slice(0, -1); // the trailing effort marker follows the last message
+	assert.deepEqual(prefix, live.messages.slice(0, prefix.length), "same messages, earlier summary replayed the same way");
+	assert(!JSON.stringify(summary.messages).includes("keep me"), "kept messages stay out");
+	assert.equal(summary.compaction.type, "summarize");
+	assert.equal(await capture((fetch) => nativeCompaction(event, ctx, tools, fetch, transcript.slice(0, 2))).then((body) => body.tools[0].name), "lookup",
+		"a transcript that does not reach the cut falls back to the rebuilt request");
+});

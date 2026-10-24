@@ -148,6 +148,19 @@ export function piAutoPersistsSelectedModel(version: string): boolean {
  * Deliberately shallow. This must never touch, log or return a secret — it reports the shape of
  * the container and nothing about what is inside it.
  */
+/**
+ * Whether the host has the `context_with_system` event (Pi 0.87.0). There, a changed `context`
+ * result makes Pi fold every mid-conversation system message (tool additions and removals) into
+ * the leading one, which rewrites the cached prompt prefix; full-transcript handlers avoid that.
+ * Unknown/non-semver hosts keep the `context` event.
+ */
+export function piHasFullTranscriptContext(version: string): boolean {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version.trim());
+  if (!match) return false;
+  const [major, minor] = match.slice(1, 3).map(Number) as [number, number];
+  return major > 0 || minor >= 87;
+}
+
 export function checkAuthShape(raw: unknown): ShapeVerdict {
   const problems: string[] = [];
   if (!isPlainObject(raw)) {
