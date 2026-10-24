@@ -10733,7 +10733,8 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		const preserved = preserveInterrupted(event?.messages);
 		const messages = preserved ?? event?.messages;
 		// The foreground request as sent, so a summary request can repeat it from the prompt cache.
-		if (Array.isArray(messages) && ctx?.model) lastTranscript = { model: `${ctx.model.provider}/${ctx.model.id}`, messages: [...messages] };
+		if (anthropicCompaction && Array.isArray(messages) && ctx?.model?.api === "anthropic-messages")
+			lastTranscript = { model: `${ctx.model.provider}/${ctx.model.id}`, messages: [...messages] };
 		return preserved ? { messages: preserved } : undefined;
 	});
 

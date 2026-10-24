@@ -143,12 +143,6 @@ export function piAutoPersistsSelectedModel(version: string): boolean {
 }
 
 /**
- * `auth.json`: a flat map of provider id → credential record carrying a `type`.
- *
- * Deliberately shallow. This must never touch, log or return a secret — it reports the shape of
- * the container and nothing about what is inside it.
- */
-/**
  * Whether the host has the `context_with_system` event (Pi 0.87.0). There, a changed `context`
  * result makes Pi fold every mid-conversation system message (tool additions and removals) into
  * the leading one, which rewrites the cached prompt prefix; full-transcript handlers avoid that.
@@ -161,6 +155,12 @@ export function piHasFullTranscriptContext(version: string): boolean {
   return major > 0 || minor >= 87;
 }
 
+/**
+ * `auth.json`: a flat map of provider id → credential record carrying a `type`.
+ *
+ * Deliberately shallow. This must never touch, log or return a secret — it reports the shape of
+ * the container and nothing about what is inside it.
+ */
 export function checkAuthShape(raw: unknown): ShapeVerdict {
   const problems: string[] = [];
   if (!isPlainObject(raw)) {
