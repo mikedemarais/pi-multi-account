@@ -121,7 +121,7 @@ function tokens(value: unknown): number {
 /** Validate the summary response and total the usage of every sampling iteration. */
 export function parseSummary(response: Json, modelId: string) {
 	// Only a short enum-like reason is shown: the body is provider-controlled.
-	if (response.stop_reason !== "compaction") throw new Error(`no summary (${/^[a-z_]{1,32}$/.test(response.stop_reason) ? response.stop_reason : "invalid response"})`);
+	if (response.stop_reason !== "compaction") throw new Error(`no summary (${typeof response.stop_reason === "string" && /^[a-z_]{1,32}$/.test(response.stop_reason) ? response.stop_reason : "invalid response"})`);
 	if (response.model !== modelId) throw new Error("unexpected summary model");
 	if (!Array.isArray(response.content) || response.content.length !== 1) throw new Error("expected one compaction block");
 	const block = signedBlock(response.content[0]);

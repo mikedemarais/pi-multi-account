@@ -8035,7 +8035,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			return await native.nativeCompaction(event, ctx, pi.getAllTools().filter((tool) => active.has(tool.name)), fetch, transcript);
 		} catch (error) {
 			if (event?.signal?.aborted) return { cancel: true as const };
-			// Reasons are fixed strings or HTTP statuses; provider bodies are never surfaced.
+			// Reasons are fixed strings, HTTP statuses or runtime errors; provider bodies are never surfaced.
 			ctx.ui?.notify?.(`Anthropic native compaction unavailable (${error instanceof Error ? error.message : "failed"}); using a text summary.`, "warning");
 			return undefined;
 		}
@@ -10724,8 +10724,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	// A changed `context` result folds mid-conversation system messages (tool changes) into the
 	// leading one and rewrites the cached prefix, so hosts with the full-transcript event use it.
 	const fullTranscriptContext = piHasFullTranscriptContext(PI_HOST_VERSION);
-	safeOn("context", (event: any) => {
-		if (fullTranscriptContext) return undefined;
+	if (!fullTranscriptContext) safeOn("context", (event: any) => {
 		const preserved = preserveInterrupted(event?.messages);
 		return preserved ? { messages: preserved } : undefined;
 	});

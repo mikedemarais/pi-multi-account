@@ -120,6 +120,7 @@ test("native compaction throws (so Pi's summary runs) on HTTP errors, bad replie
 	await assert.rejects(nativeCompaction(event, ctx, [], async () => new Response("secret prompt echo", { status: 500 })), /^Error: HTTP 500$/);
 	await assert.rejects(nativeCompaction(event, ctx, [], async () => reply("x", { stop_reason: "end_turn" })), /no summary \(end_turn\)/);
 	await assert.rejects(nativeCompaction(event, ctx, [], async () => reply("x", { stop_reason: "Provider text with a secret" })), /^Error: no summary \(invalid response\)$/);
+	await assert.rejects(nativeCompaction(event, ctx, [], async () => reply("x", { stop_reason: undefined })), /^Error: no summary \(invalid response\)$/);
 	await assert.rejects(nativeCompaction(event, ctx, [], async () => new Response("not json")), /invalid JSON response/);
 	await assert.rejects(nativeCompaction(event, ctx, [], async () => { ctx.sessionManager.appendMessage({ role: "user", content: "y", timestamp: 6 }); return reply(); }), /session changed/);
 	await assert.rejects(nativeCompaction(event, { ...ctx, model: { ...slot, id: "claude-haiku-4-5" } }, [], async () => reply()), /not eligible/);
