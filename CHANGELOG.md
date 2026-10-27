@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-Fork changes on top of upstream 1.26.0.
+Fork changes on top of upstream 1.27.0.
 
 ### Added
 
@@ -32,6 +32,20 @@ Fork changes on top of upstream 1.26.0.
 - Forced OAuth refreshes also run on Pi hosts that expose no AuthStorage to extensions (Pi 0.87 and later). Upstream reports them unsupported there; the fork runs upstream's fenced `auth.json` refresh transaction directly when that file is writable. A host that exposes a store without `modify()` is still refused.
 
 - The Anthropic OAuth billing header reports the locally installed Claude Code (`claude --version`) when it is newer than `CLAUDE_CODE_VERSION`, so a pinned install keeps working when a new model requires a newer client. Set `PI_MULTI_ACCOUNT_DETECT_CLAUDE_CODE_VERSION=0` to use only the constant.
+
+## [1.27.0] — 2026-10-26
+
+### Added
+
+- Google Antigravity browser login is available by default on compatible hosts: install, `/login`, authorize in the browser, return to Pi. No manual client configuration or token import. Existing explicit opt-out is retained.
+- Account-discovered models, signed tool/result replay, per-model quota observations, bounded callback/setup handling and no API-key or AI-credit fallback. The integration is unofficial and asks for account-risk consent.
+- Improved `/multi-account accounts` overview (#100): separate quota/reset columns, observation freshness, earliest known recovery and sorted estimates without changing rotation or adding requests.
+
+### Security and compatibility
+
+- Pin the development HTTP client to patched undici 8.12.2; verify the resolved lock and clean install rather than relying on an override declaration alone.
+- Distinguish the pinned public installed-application identity from private account tokens; retain strict private-file/secret checks with an exact, source-reviewed protocol-profile exception only. The former manual client file is neither required nor read.
+- Fresh-install native-host tests exercise default registration, browser callback and account catalog without a config file. Modern transcript APIs are capability-gated; legacy host support for other providers remains covered by CI.
 
 ## [1.26.0] — 2026-10-19
 

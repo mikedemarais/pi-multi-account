@@ -777,8 +777,9 @@ function setup(opts: {
 	if (opts.independentRoots) process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS = "1";
 	else delete process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS;
 	process.argv = ["node", "pi", ...(opts.cliArgs ?? [])];
+	let initialization: ReturnType<typeof piMultiAccount>;
 	try {
-		piMultiAccount(pi, { codexCompaction: opts.codexCompaction, anthropicNativeCompaction: opts.anthropicNativeCompaction });
+		initialization = piMultiAccount(pi, { codexCompaction: opts.codexCompaction, anthropicNativeCompaction: opts.anthropicNativeCompaction });
 	} finally {
 		process.argv = previousArgv;
 		if (previousSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
@@ -790,6 +791,8 @@ function setup(opts: {
 	}
 
 	const fire = async (event: string, payload: any = {}) => {
+		// Real Pi awaits async provider registration before lifecycle delivery.
+		await initialization;
 		const handlers = events[event];
 		if (!handlers || handlers.length === 0) return undefined;
 		if (event === "context") {
@@ -851,8 +854,10 @@ function setup(opts: {
 		}
 		return result;
 	};
-	const command = async (args: string) =>
-		commands["multi-account"]?.(args, ctx);
+	const command = async (args: string) => {
+		await initialization;
+		return commands["multi-account"]?.(args, ctx);
+	};
 	const input = async (text: string, images?: any[]) =>
 		fire("input", { type: "input", text, images, source: "interactive" });
 
@@ -10161,7 +10166,8 @@ test("accounts lists provider identity, quota and routing state without credenti
 
 	await t.command("accounts");
 	const table = t.rec.notifies.at(-1) ?? "";
-	assert.match(table, /Slot\s+Alias\s+Account\s+Plan\s+Primary\s+Secondary\s+Tertiary\s+Status/);
+	assert.match(table, /Slot\s+Alias\s+Account\s+Plan\s+Primary left\s+Reset\s+Secondary left\s+Reset\s+Tertiary left\s+Reset\s+Observed\s+Quota estimate\s+Status/);
+	assert.match(table, /Earliest known quota recovery: unknown/);
 	assert.match(table, /openai-codex-account-2\s+alice\s+alice@example\.com\s+plus/);
 	assert.match(table, /5h 80%/);
 	assert.match(table, /7d 50%/);
@@ -10169,6 +10175,64 @@ test("accounts lists provider identity, quota and routing state without credenti
 	assert.match(table, /\banthropic\b[\s\S]*eligible.*unverified/);
 	assert.doesNotMatch(table, /anthropic-secret|anthropic-refresh|codex-secret|codex-refresh|workspace-safe-id/);
 });
+
+test("accounts overview separates quota estimates from checks and waits for every exhausted window", async () => {
+	const now = Date.now();
+	const t = setup({
+		accounts: { anthropic: { type: "oauth", access: "overview-token", refresh: "overview-refresh" } },
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedState: {
+			stateVersion: 5, exhaustedUntilByProvider: {}, exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {}, invalidatedByProvider: {}, lastSwitches: [],
+			usageByProvider: { anthropic: {
+				provider: "anthropic", family: "anthropic", fetchedAt: now,
+				primary: { usedPercent: 100, resetAt: now + 30 * 60_000, windowSeconds: 18_000 },
+				secondary: { usedPercent: 100, resetAt: now + 120 * 60_000, windowSeconds: 604_800 },
+			} },
+		},
+	});
+	await t.command("accounts");
+	const table = t.rec.notifies.at(-1) ?? "";
+	assert.match(table, /Earliest known quota recovery: anthropic in ~2h/);
+	assert.match(table, /not guaranteed availability/);
+	assert.match(table, /fresh/);
+	assert.equal(t.rec.setModels.length, 0, "rendering must not switch models");
+});
+
+for (const scenario of ["stale", "passed", "cursor", "excluded", "healthy", "contradictory"] as const) {
+	test(`accounts does not promise recovery from ${scenario} evidence`, async () => {
+		const now = Date.now();
+		const provider = scenario === "cursor" ? "cursor" : "anthropic";
+		const t = setup({
+			accounts: { [provider]: { type: "oauth", access: "overview-token", refresh: "overview-refresh" } },
+			current: { provider, id: scenario === "cursor" ? "composer-2" : "claude-opus-4-8" },
+			config: { showUsage: false, ...(scenario === "excluded" ? { excludedProviders: [provider] } : {}) },
+			seedState: {
+				stateVersion: 5, exhaustedUntilByProvider: {}, exhaustedUntilByModel: {},
+				lastProbeAtByProvider: {}, invalidatedByProvider: {}, lastSwitches: [],
+				usageByProvider: { [provider]: {
+					provider, family: scenario === "cursor" ? "cursor" : "anthropic",
+					fetchedAt: now - (scenario === "stale" ? 86_400_000 : 0),
+					...(scenario === "contradictory" ? { serviceable: true } : {}),
+					primary: { usedPercent: scenario === "healthy" ? 10 : 100,
+						resetAt: now + (scenario === "passed" ? -60_000 : 3_600_000), windowSeconds: 18_000 },
+				} },
+			},
+		});
+		const originalFetch = globalThis.fetch;
+		let requests = 0;
+		globalThis.fetch = (async () => { requests++; throw new Error("overview must be cache-only"); }) as typeof fetch;
+		try {
+			await t.command("accounts");
+			const table = t.rec.notifies.at(-1) ?? "";
+			assert.match(table, /Earliest known quota recovery: unknown/);
+			if (scenario === "stale") assert.match(table, /stale/);
+			if (scenario === "passed") assert.match(table, /passed; refresh/);
+			assert.equal(requests, 0);
+			assert.equal(t.rec.setModels.length, 0);
+		} finally { globalThis.fetch = originalFetch; }
+	});
+}
 
 test("accounts refresh explicitly loads every supported account while the footer is disabled", async () => {
 	const originalFetch = globalThis.fetch;
@@ -10527,6 +10591,19 @@ test("a 402 'out of credits' refusal is actionable, not unhandled", async () => 
 		t.rec.setModels.length > before,
 		`must move off a provider that refuses every request, got: ${t.rec.setModels.slice(before).join(", ") || "none"}`,
 	);
+});
+
+test("Antigravity model quota does not bench unrelated model quotas on the same account", async () => {
+ const provider = "google-antigravity", model = "gemini-4-argon-high";
+ const t = setup({ accounts: { [provider]: { type: "oauth", access: "ag-token", refresh: "ag-refresh" },
+  anthropic: { type: "oauth", access: "a-token", refresh: "a-refresh" } },
+  current: { provider, id: model }, hostModelsByProvider: { [provider]: [model, "gemini-3.8-flash-high"] } });
+ await t.fire("session_start");
+ await finishError(t, provider, model, `Antigravity model quota exhausted: ${model}; no credit overage request sent`);
+ const state = t.readState();
+ assert.equal(state.exhaustedUntilByProvider?.[provider] ?? 0, 0);
+ assert.ok((state.exhaustedUntilByModel?.[`${provider}/${model}`] ?? 0) > Date.now(), JSON.stringify({ state, switches: t.rec.setModels, notices: t.rec.notifies }));
+ assert.equal(state.exhaustedUntilByModel?.[`${provider}/gemini-3.8-flash-high`] ?? 0, 0);
 });
 
 test("a provider that is out of credits is benched, so failover cannot land back on it", async () => {
@@ -12129,11 +12206,13 @@ test("only-active never empties a public provider, including account aliases", a
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
 	});
 	await t.fire("session_start");
+	// Login-only discovered providers legitimately start empty before authorization.
+	const initiallyEmpty = new Set(t.rec.registrations.filter(r => r.models === 0).map(r => r.provider));
 	await t.command("only-active on");
 	const emptied = [
 		...new Set(
 			[...t.rec.registrations]
-				.filter((r) => r.models === 0)
+				.filter((r) => r.models === 0 && !initiallyEmpty.has(r.provider))
 				.map((r) => r.provider),
 		),
 	];
