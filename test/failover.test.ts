@@ -15480,6 +15480,7 @@ function codexResetSetup(config: Record<string, unknown>, confirm?: (title: stri
 	});
 	const prompts: string[] = [];
 	if (confirm) {
+		t.ctx.hasUI = true;
 		t.ctx.ui.confirm = async (title: string, message: string) => {
 			prompts.push(`${title}\n${message}`);
 			return confirm(title, message);
@@ -15640,7 +15641,7 @@ test("a successful response that shows a paid account's included usage spent res
 		assert.deepEqual(t.rec.setModels, []);
 		await t.fire("after_provider_response", { status: 200, headers: spentCodexHeaders(3 * 86_400_000) });
 		await wait(30);
-		assert.equal(backend.seen.consumed.length, 1, "a stale header after the reset is answered by the server, not a second credit");
+		assert.equal(backend.seen.consumed.length, 1, "a stale spent header after the reset re-reads live usage instead of spending again");
 	} finally {
 		await t.fire("session_shutdown");
 		backend.restore();
@@ -15666,6 +15667,21 @@ test("while the user is asked about a reset, the account's next request waits in
 		await t.fire("after_provider_response", { status: 200, headers: spentCodexHeaders(2 * 60 * 60 * 1000) });
 		await wait(30);
 		assert.equal(prompts.length, 1);
+	} finally {
+		await t.fire("session_shutdown");
+		backend.restore();
+	}
+});
+
+test("after a refused request spends a reset, the turn continues on the same paid account", async () => {
+	const backend = fakeCodexResetBackend({ naturalResetInMs: 3 * 86_400_000 });
+	const { t } = codexResetSetup({ codexResetCredits: "auto", autoContinue: true });
+	try {
+		await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+		assert.equal(backend.seen.consumed.length, 1);
+		assert.deepEqual(t.rec.setModels, []);
+		assert.equal(t.rec.continueCalls.length, 1, "the interrupted turn retries once on the reset account");
+		assert.equal(t.rec.sent.length, 0);
 	} finally {
 		await t.fire("session_shutdown");
 		backend.restore();

@@ -10,8 +10,8 @@
  *                                                      → { code, windows_reset }
  *
  * `redeem_request_id` is an idempotency key: retrying a request whose outcome is unknown with
- * the SAME key can never spend a second credit. The server answers `nothing_to_reset` instead of
- * spending a credit on an account whose limits are not exhausted.
+ * the SAME key cannot spend a second credit. The server is expected to answer
+ * `nothing_to_reset` for an account that needs no reset; callers still re-read usage first.
  *
  * Spending a credit is irreversible, so everything here is a pure decision or a single request;
  * the policy of WHEN to spend lives in index.ts behind the `codexResetCredits` setting.
@@ -28,7 +28,6 @@ export type CodexResetCredit = {
 	resetType: string;
 	status: string;
 	expiresAt?: number;
-	title?: string;
 };
 
 export type CodexResetCreditList = {
@@ -61,11 +60,14 @@ export function normalizeCodexResetCreditsMode(value: unknown): CodexResetCredit
 }
 
 /**
- * Only paid plans may spend a credit. Free accounts are the last-resort fallback and keep
- * their credits; an unknown plan is treated as free so a missing field can never spend one.
+ * Only known paid plans may spend a credit (Codex `PlanType`). Free accounts are the
+ * last-resort fallback and keep their credits, and so does any plan this list does not name:
+ * a new or missing plan type can never spend one.
  */
+const PAID_PLAN = /^(?:go|plus|pro|prolite|promax|team|business|enterprise|ent\d+|self_serve_business_\w+|enterprise_cbp_\w+)$/;
+
 export function isPaidCodexPlan(plan: string | undefined): boolean {
-	return typeof plan === "string" && plan.trim() !== "" && !/free|guest/i.test(plan);
+	return typeof plan === "string" && PAID_PLAN.test(plan.trim().toLowerCase());
 }
 
 function timestampMs(value: unknown): number | undefined {
@@ -84,7 +86,6 @@ export function parseCodexResetCreditList(body: unknown): CodexResetCreditList {
 			resetType: typeof credit.reset_type === "string" ? credit.reset_type : "unknown",
 			status: typeof credit.status === "string" ? credit.status : "unknown",
 			expiresAt: timestampMs(credit.expires_at),
-			title: typeof credit.title === "string" && credit.title.trim() ? credit.title.trim() : undefined,
 		}];
 	});
 	const count = Number(source.available_count);
@@ -104,61 +105,21 @@ export function soonestExpiringCredit(
 		.sort((a, b) => (a.expiresAt ?? Number.POSITIVE_INFINITY) - (b.expiresAt ?? Number.POSITIVE_INFINITY))[0];
 }
 
-type Window = { usedPercent: number; resetAt: number };
-
 /**
- * Whether a fresh Codex usage reading shows the account spent, and when it reopens on its own.
- * The latest reset among the maxed windows is the natural recovery time, because every window is
- * a simultaneous constraint. A `limit_reached` verdict with no maxed window (rounding) falls
- * back to the latest future window reset.
+ * Why an exhausted paid account must confirm before spending, or undefined to spend now.
+ * `naturalResetAt` is when its usage reopens on its own (undefined when unknown). A reset that
+ * is close makes a credit poor value, so `auto` asks instead of spending.
  */
-export function codexExhaustion(
-	snapshot: { serviceable?: boolean; primary?: Window; secondary?: Window },
-	now = Date.now(),
-): { exhausted: boolean; naturalResetAt?: number } {
-	const windows = [snapshot.primary, snapshot.secondary].filter(
-		(window): window is Window => !!window && window.resetAt > now,
-	);
-	const maxed = windows.filter((window) => window.usedPercent >= 100);
-	const exhausted = snapshot.serviceable === false || (snapshot.serviceable !== true && maxed.length > 0);
-	if (!exhausted) return { exhausted };
-	const pool = maxed.length > 0 ? maxed : windows;
-	return {
-		exhausted,
-		naturalResetAt: pool.length > 0 ? Math.max(...pool.map((window) => window.resetAt)) : undefined,
-	};
-}
-
-export type CodexResetDecision =
-	| { action: "skip"; reason: string }
-	| { action: "redeem" }
-	| { action: "ask"; reason: string };
-
-/**
- * Decide whether an exhausted account should spend a credit.
- *
- * `naturalResetAt` is when the blocking usage windows reopen on their own (undefined when the
- * account reports no usable reset time). A reset that is close makes a credit poor value, so
- * `auto` asks instead of spending; with no UI to ask, the caller treats `ask` as a refusal.
- */
-export function decideCodexReset(input: {
+export function codexResetAskReason(input: {
 	mode: CodexResetCreditsMode;
-	plan: string | undefined;
-	exhausted: boolean;
-	credit: CodexResetCredit | undefined;
 	naturalResetAt: number | undefined;
 	minNaturalResetMs: number;
 	now?: number;
-}): CodexResetDecision {
-	const now = input.now ?? Date.now();
-	if (input.mode === "off") return { action: "skip", reason: "codexResetCredits is off" };
-	if (!isPaidCodexPlan(input.plan)) return { action: "skip", reason: `plan ${input.plan ?? "unknown"} keeps its credits` };
-	if (!input.exhausted) return { action: "skip", reason: "account is not exhausted" };
-	if (!input.credit) return { action: "skip", reason: "no reset credit available" };
-	if (input.mode === "ask") return { action: "ask", reason: "codexResetCredits is ask" };
-	if (input.naturalResetAt === undefined) return { action: "ask", reason: "natural reset time unknown" };
-	if (input.naturalResetAt - now < input.minNaturalResetMs) return { action: "ask", reason: "natural reset is near" };
-	return { action: "redeem" };
+}): string | undefined {
+	if (input.mode === "ask") return "codexResetCredits is ask";
+	if (input.naturalResetAt === undefined) return "natural reset time unknown";
+	if (input.naturalResetAt - (input.now ?? Date.now()) < input.minNaturalResetMs) return "natural reset is near";
+	return undefined;
 }
 
 function headers(credential: Credential): Record<string, string> {
@@ -201,12 +162,11 @@ export async function fetchCodexResetCredits(
 
 const CONSUME_CODES = new Set<CodexResetConsumeCode>(["reset", "nothing_to_reset", "no_credit", "already_redeemed"]);
 
-export async function consumeCodexResetCredit(
+async function consumeCodexResetCredit(
 	credential: Credential,
 	request: { redeemRequestId: string; creditId?: string },
-	options: RequestOptions = {},
+	options: RequestOptions,
 ): Promise<CodexResetConsumeResult> {
-	if (!request.redeemRequestId) throw new CodexResetCreditError("redeemRequestId must not be empty");
 	const body = await requestJson(
 		CODEX_RESET_CREDITS_CONSUME_URL,
 		{
@@ -235,6 +195,7 @@ export async function redeemCodexResetCredit(
 	request: { redeemRequestId: string; creditId?: string },
 	options: RequestOptions = {},
 ): Promise<CodexResetConsumeResult> {
+	if (!request.redeemRequestId) throw new CodexResetCreditError("redeemRequestId must not be empty");
 	try {
 		return await consumeCodexResetCredit(credential, request, options);
 	} catch (error) {

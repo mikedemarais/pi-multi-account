@@ -37,8 +37,7 @@ import { normalizeModelPins, persistModelPin, validModelPinScope } from "./model
 import { assertOpenAIChatGPTConfiguration, cloneOpenAIChatGPTProvider, isOpenAIChatGPTCredential, OPENAI_CHATGPT_URL, supportsOpenAIChatGPT } from "./openai-chatgpt.ts";
 import { mutateConfigFile } from "./config-file-transaction.ts";
 import {
-	codexExhaustion,
-	decideCodexReset,
+	codexResetAskReason,
 	fetchCodexResetCredits,
 	isPaidCodexPlan,
 	normalizeCodexResetCreditsMode,
@@ -3553,6 +3552,19 @@ function cooldownMsFromUsage(
 	return (snapshot.family === "cursor" ? Math.min : Math.max)(...blocking.map((w) => w.resetAt)) - now;
 }
 
+/**
+ * Whether a Codex reading shows the account's included usage spent, and when it reopens on its
+ * own. `serviceable: false` with credits is still spent: Codex then serves from the purchased
+ * credit balance.
+ */
+function codexExhaustion(snapshot: UsageSnapshot, now = Date.now()) {
+	const ms = cooldownMsFromUsage(snapshot, now) ?? 0;
+	return {
+		exhausted: snapshot.serviceable === false || ms > 0,
+		naturalResetAt: ms > 0 ? now + ms : undefined,
+	};
+}
+
 function formatUntil(timestamp: number) {
 	const ms = timestamp - Date.now();
 	if (ms <= 0) return "expired";
@@ -5666,15 +5678,16 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	}
 
 	/** Codex and Claude subscription responses carry the usage windows in their headers. */
-	function storeUsageFromHeaders(ctx: any, provider: string, headers: unknown) {
+	function storeUsageFromHeaders(ctx: any, provider: string, headers: unknown): UsageSnapshot | undefined {
 		const family = usageFamily(provider);
-		if (family !== "codex" && family !== "anthropic") return;
+		if (family !== "codex" && family !== "anthropic") return undefined;
 		const entry = readAuthFile()[provider];
 		const hash = entry ? credentialHash(entry) : undefined;
 		const snapshot = family === "codex"
 			? parseCodexUsageHeaders(provider, headers ?? {}, Date.now(), hash)
 			: parseAnthropicUsageHeaders(provider, headers ?? {}, Date.now(), hash, usageByProvider.get(provider));
-		if (snapshot) storeUsage(ctx, snapshot);
+		// The reading as reported, not merged: a merged snapshot keeps an older poll's verdict.
+		return snapshot && storeUsage(ctx, snapshot) ? snapshot : undefined;
 	}
 
 	function storeUsage(ctx: any, snapshot: UsageSnapshot): boolean {
@@ -5692,16 +5705,6 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		// reports the real reset from the live snapshot. Never benches an account with headroom
 		// (cooldownMsFromUsage returns 0 while the primary window is < 100%).
 		const blockMs = cooldownMsFromUsage(snapshot);
-		// A paid Codex account whose included usage is spent keeps answering from its credit
-		// balance, so no refusal may ever arrive to trigger a reset. Act on the reading itself,
-		// but only for the account this session is actually using.
-		if (
-			snapshot.family === "codex" &&
-			ctx?.model?.provider === snapshot.provider &&
-			codexExhaustion(snapshot).exhausted
-		)
-			runBackground("codex reset credit", ctx, () =>
-				maybeRedeemCodexResetCredit(ctx, snapshot.provider, { background: true }));
 		if (blockMs !== undefined && blockMs > 0) {
 			markExhausted(snapshot.provider, blockMs);
 		} else if (blockMs === 0) {
@@ -7595,8 +7598,10 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	}
 
 	async function attemptCodexResetCredit(ctx: any, provider: string): Promise<boolean> {
+		// Marked up front so a failed or skipped check throttles background re-checks too; a
+		// confirmed reset clears it.
+		codexResetSkippedAt.set(provider, Date.now());
 		const skip = (reason: string) => {
-			codexResetSkippedAt.set(provider, Date.now());
 			logEvent("codex_reset_skipped", { provider, reason });
 			return false;
 		};
@@ -7607,44 +7612,43 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		if (!entry?.access) return skip("no OAuth access token");
 		const list = await fetchCodexResetCredits(entry);
 		const credit = soonestExpiringCredit(list);
-		const decision = decideCodexReset({
+		if (!credit) return skip("no reset credit available");
+		const label = `${providerUsageLabel(provider)} (${usage.snapshot.plan})`;
+		const remaining = Math.max(list.availableCount, 1);
+		const askReason = codexResetAskReason({
 			mode: config.codexResetCredits,
-			plan: usage.snapshot.plan,
-			exhausted: usage.exhausted,
-			credit,
 			naturalResetAt: usage.naturalResetAt,
 			minNaturalResetMs: config.codexResetCreditMinNaturalResetMs,
 		});
-		if (decision.action === "skip") return skip(decision.reason);
-		const label = `${providerUsageLabel(provider)} (${usage.snapshot.plan})`;
-		const remaining = Math.max(list.availableCount, 1);
-		if (decision.action === "ask") {
+		if (askReason) {
+			// A refused or unanswerable question holds until this exhaustion's natural reset.
+			const decline = (reason: string) => {
+				declinedCodexResetUntil.set(provider, usage.naturalResetAt ?? Date.now() + config.maxRecheckIntervalMs);
+				return skip(reason);
+			};
 			const natural = usage.naturalResetAt
 				? `It resets on its own in ~${formatUntil(usage.naturalResetAt)}.`
 				: "Its natural reset time is unknown.";
-			const expiry = credit?.expiresAt
-				? ` The soonest-expiring one expires ${new Date(credit.expiresAt).toLocaleDateString()}.`
-				: "";
-			if (ctx?.hasUI === false || typeof ctx?.ui?.confirm !== "function") {
+			if (!ctx?.hasUI || typeof ctx?.ui?.confirm !== "function") {
 				ctx?.ui?.notify?.(
 					`pi-multi-account: ${label} is out of usage. ${natural} Not spending one of ${remaining} banked reset(s) without confirmation; run /multi-account use-reset ${provider} to spend one.`,
 					"warning",
 				);
-				return skip(`${decision.reason}; no UI to confirm`);
+				return decline(`${askReason}; no UI to confirm`);
 			}
-			logEvent("codex_reset_prompt", { provider, reason: decision.reason, naturalResetAt: usage.naturalResetAt ?? null });
+			logEvent("codex_reset_prompt", { provider, reason: askReason, naturalResetAt: usage.naturalResetAt ?? null });
+			const expiry = credit.expiresAt
+				? ` The soonest-expiring one expires ${new Date(credit.expiresAt).toLocaleDateString()}.`
+				: "";
 			const accepted = await ctx.ui.confirm(
 				"Use a banked Codex usage reset?",
-				`${label} is out of usage. ${natural} You have ${remaining} banked reset(s).${expiry} Use one now? Choosing no fails over to the other accounts.`,
+				`${label} is out of usage. ${natural} You have ${remaining} banked reset(s).${expiry} Use one now? Choosing no falls back to your other accounts.`,
 			);
-			if (!accepted) {
-				declinedCodexResetUntil.set(provider, usage.naturalResetAt ?? Date.now() + config.maxRecheckIntervalMs);
-				return skip("declined");
-			}
+			if (!accepted) return decline("declined");
 			usage = await readCodexExhaustion(ctx, provider);
 			if (!usage.exhausted) return skip("account recovered while waiting for confirmation");
 		}
-		return spendCodexResetCredit(ctx, provider, credit?.id, label, remaining - 1);
+		return spendCodexResetCredit(ctx, provider, credit.id, label, remaining - 1);
 	}
 
 	async function spendCodexResetCredit(
@@ -13429,7 +13433,9 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		// included: whether a request reached a provider is a fact about the session, not
 		// something this extension's own settings get an opinion about.
 		noteProviderRequestObserved();
-		if (ctx.model) storeUsageFromHeaders(ctx, ctx.model.provider, (event as any).headers);
+		const headerUsage = ctx.model
+			? storeUsageFromHeaders(ctx, ctx.model.provider, (event as any).headers)
+			: undefined;
 		if (!automaticFailoverEnabled()) return;
 		const status = (event as any).status;
 		if (status < 400 && ctx.model) {
@@ -13437,6 +13443,13 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			noteAuthSuccess(ctx.model.provider, ctx.model.id);
 			noteProviderResponseStarted();
 			responseCooldownHints.delete(ctx.model.provider);
+			// A paid Codex account whose included usage is spent keeps answering from its credit
+			// balance, so no refusal arrives to trigger a reset. Act on this response's reading.
+			if (headerUsage?.family === "codex" && codexExhaustion(headerUsage).exhausted) {
+				const provider = ctx.model.provider;
+				runBackground("codex reset credit", ctx, () =>
+					maybeRedeemCodexResetCredit(ctx, provider, { background: true }));
+			}
 			return;
 		}
 		if ((status === 429 || status === 402 || status === 403) && ctx.model) {

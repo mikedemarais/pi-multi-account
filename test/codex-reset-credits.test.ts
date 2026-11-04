@@ -3,8 +3,7 @@ import test from "node:test";
 import {
 	CODEX_RESET_CREDITS_CONSUME_URL,
 	CODEX_RESET_CREDITS_URL,
-	codexExhaustion,
-	decideCodexReset,
+	codexResetAskReason,
 	fetchCodexResetCredits,
 	isPaidCodexPlan,
 	normalizeCodexResetCreditsMode,
@@ -37,50 +36,23 @@ test("the soonest-expiring usable credit is chosen; non-expiring credits go last
 	assert.equal(soonestExpiringCredit(parseCodexResetCreditList({}), NOW), undefined);
 });
 
-test("only paid plans may spend credits; an unknown plan never does", () => {
-	for (const plan of ["pro", "plus", "team", "business", "enterprise"]) assert.equal(isPaidCodexPlan(plan), true, plan);
-	for (const plan of ["free", "free_workspace", "guest", "", undefined]) assert.equal(isPaidCodexPlan(plan), false, String(plan));
+test("only known paid plans may spend credits; free, unknown, and new plan types never do", () => {
+	for (const plan of ["pro", "plus", "go", "prolite", "promax", "team", "business", "enterprise", "ent26", "self_serve_business_usage_based", "enterprise_cbp_automation"])
+		assert.equal(isPaidCodexPlan(plan), true, plan);
+	for (const plan of ["free", "free_workspace", "guest", "unknown", "some_future_plan", "", undefined])
+		assert.equal(isPaidCodexPlan(plan), false, String(plan));
 	assert.equal(normalizeCodexResetCreditsMode("auto"), "auto");
 	assert.equal(normalizeCodexResetCreditsMode("ask"), "ask");
 	assert.equal(normalizeCodexResetCreditsMode(true), "off");
 	assert.equal(normalizeCodexResetCreditsMode(undefined), "off");
 });
 
-test("exhaustion uses the latest maxed window as the natural reset", () => {
-	assert.deepEqual(
-		codexExhaustion({
-			primary: { usedPercent: 100, resetAt: NOW + 2 * HOUR },
-			secondary: { usedPercent: 100, resetAt: NOW + 72 * HOUR },
-		}, NOW),
-		{ exhausted: true, naturalResetAt: NOW + 72 * HOUR },
-	);
-	assert.deepEqual(
-		codexExhaustion({ primary: { usedPercent: 88, resetAt: NOW + HOUR } }, NOW),
-		{ exhausted: false },
-	);
-	// limit_reached with a rounded-down window still counts, using that window's reset.
-	assert.deepEqual(
-		codexExhaustion({ serviceable: false, primary: { usedPercent: 99, resetAt: NOW + 30 * HOUR } }, NOW),
-		{ exhausted: true, naturalResetAt: NOW + 30 * HOUR },
-	);
-	assert.deepEqual(codexExhaustion({ serviceable: false }, NOW), { exhausted: true, naturalResetAt: undefined });
-	assert.deepEqual(
-		codexExhaustion({ serviceable: true, primary: { usedPercent: 100, resetAt: NOW + HOUR } }, NOW),
-		{ exhausted: false },
-	);
-});
-
 test("auto spends only when the natural reset is far; otherwise it asks", () => {
-	const credit = { id: "c", resetType: "codex_rate_limits", status: "available" };
-	const base = { mode: "auto" as const, plan: "pro", exhausted: true, credit, minNaturalResetMs: 6 * HOUR, now: NOW };
-	assert.deepEqual(decideCodexReset({ ...base, naturalResetAt: NOW + 7 * HOUR }), { action: "redeem" });
-	assert.equal(decideCodexReset({ ...base, naturalResetAt: NOW + 5 * HOUR }).action, "ask");
-	assert.equal(decideCodexReset({ ...base, naturalResetAt: undefined }).action, "ask");
-	assert.equal(decideCodexReset({ ...base, mode: "ask", naturalResetAt: NOW + 100 * HOUR }).action, "ask");
-	assert.equal(decideCodexReset({ ...base, mode: "off", naturalResetAt: NOW + 100 * HOUR }).action, "skip");
-	assert.equal(decideCodexReset({ ...base, plan: "free", naturalResetAt: NOW + 100 * HOUR }).action, "skip");
-	assert.equal(decideCodexReset({ ...base, exhausted: false, naturalResetAt: NOW + 100 * HOUR }).action, "skip");
-	assert.equal(decideCodexReset({ ...base, credit: undefined, naturalResetAt: NOW + 100 * HOUR }).action, "skip");
+	const base = { mode: "auto" as const, minNaturalResetMs: 6 * HOUR, now: NOW };
+	assert.equal(codexResetAskReason({ ...base, naturalResetAt: NOW + 7 * HOUR }), undefined);
+	assert.equal(codexResetAskReason({ ...base, naturalResetAt: NOW + 5 * HOUR }), "natural reset is near");
+	assert.equal(codexResetAskReason({ ...base, naturalResetAt: undefined }), "natural reset time unknown");
+	assert.equal(codexResetAskReason({ ...base, mode: "ask", naturalResetAt: NOW + 100 * HOUR }), "codexResetCredits is ask");
 });
 
 test("list and consume speak Codex's wire contract", async () => {
