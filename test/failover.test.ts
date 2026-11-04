@@ -15404,3 +15404,212 @@ test("a Claude response's rate-limit headers record usage without ending the usa
 		await t.fire("session_shutdown");
 	}
 });
+
+// ----- Codex rate-limit reset credits --------------------------------------------------------
+
+/**
+ * A ChatGPT backend with one paid account ("pro-acct") that is out of usage and one free
+ * account ("free-acct"), each holding banked reset credits. Consuming a credit clears the paid
+ * account's limits, exactly as the real `rate-limit-reset-credits/consume` endpoint does.
+ */
+function fakeCodexResetBackend(opts: { naturalResetInMs: number; freeExhausted?: boolean }) {
+	const original = globalThis.fetch;
+	const seen = { usageReads: 0, creditLists: [] as string[], consumed: [] as Array<{ account: string; body: any }> };
+	let paidExhausted = true;
+	const now = Date.now();
+	const json = (body: unknown) =>
+		new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input instanceof Request ? input.url : input);
+		const account = new Headers(init?.headers).get("ChatGPT-Account-Id") ?? "missing";
+		const paid = account === "pro-acct";
+		if (url.endsWith("/wham/rate-limit-reset-credits/consume")) {
+			const body = JSON.parse(String(init?.body));
+			seen.consumed.push({ account, body });
+			if (!paid) return json({ code: "nothing_to_reset", windows_reset: 0 });
+			const code = paidExhausted ? "reset" : "nothing_to_reset";
+			paidExhausted = false;
+			return json({ code, windows_reset: code === "reset" ? 1 : 0 });
+		}
+		if (url.endsWith("/wham/rate-limit-reset-credits")) {
+			seen.creditLists.push(account);
+			return json({
+				credits: [
+					{ id: `${account}-late`, reset_type: "codex_rate_limits", status: "available", expires_at: new Date(now + 60 * 86_400_000).toISOString() },
+					{ id: `${account}-soonest`, reset_type: "codex_rate_limits", status: "available", expires_at: new Date(now + 20 * 86_400_000).toISOString() },
+				],
+				available_count: 2,
+			});
+		}
+		if (url.endsWith("/wham/usage")) {
+			seen.usageReads++;
+			const exhausted = paid ? paidExhausted : !!opts.freeExhausted;
+			return json({
+				plan_type: paid ? "pro" : "free",
+				rate_limit: {
+					allowed: !exhausted,
+					limit_reached: exhausted,
+					primary_window: {
+						used_percent: exhausted ? 100 : 12,
+						limit_window_seconds: paid ? 604_800 : 2_592_000,
+						reset_at: Math.floor((now + opts.naturalResetInMs) / 1000),
+					},
+				},
+				rate_limit_reset_credits: { available_count: 2 },
+			});
+		}
+		return new Response("not found", { status: 404 });
+	}) as typeof fetch;
+	return { seen, restore: () => { globalThis.fetch = original; } };
+}
+
+function codexResetSetup(config: Record<string, unknown>, confirm?: (title: string, message: string) => Promise<boolean>) {
+	const t = setup({
+		accounts: {
+			"openai-codex": { type: "oauth", access: codexAccessToken("pro-acct", "user-pro"), refresh: "pro-r", accountId: "pro-acct", expires: Date.now() + 86_400_000 },
+			"openai-codex-account-2": { type: "oauth", access: codexAccessToken("free-acct", "user-free"), refresh: "free-r", accountId: "free-acct", expires: Date.now() + 86_400_000 },
+		},
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: {
+			fallbacks: ["openai-codex", "openai-codex-account-2"],
+			autoContinue: false,
+			autoDiscoverModels: false,
+			showUsage: false,
+			...config,
+		},
+	});
+	const prompts: string[] = [];
+	if (confirm) {
+		t.ctx.ui.confirm = async (title: string, message: string) => {
+			prompts.push(`${title}\n${message}`);
+			return confirm(title, message);
+		};
+	}
+	return { t, prompts };
+}
+
+test("an exhausted paid Codex account spends its soonest-expiring reset instead of failing over to a free account", async () => {
+	const backend = fakeCodexResetBackend({ naturalResetInMs: 3 * 86_400_000 });
+	const { t, prompts } = codexResetSetup({ codexResetCredits: "auto" }, async () => {
+		throw new Error("a far natural reset must not ask");
+	});
+	try {
+		await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+		assert.deepEqual(backend.seen.consumed.map((call) => [call.account, call.body.credit_id]), [["pro-acct", "pro-acct-soonest"]]);
+		assert.ok(backend.seen.consumed[0].body.redeem_request_id, "every consume carries an idempotency key");
+		assert.deepEqual(t.rec.setModels, [], "the session stays on the reset paid account");
+		assert.equal(prompts.length, 0);
+		assert.ok(!t.readState().exhaustedUntilByProvider?.["openai-codex"], "a reset account must not stay benched");
+		assert.ok(t.rec.notifies.some((message) => /used a banked Codex reset on Codex \(pro\)/.test(message)));
+		assert.ok(!backend.seen.creditLists.includes("free-acct"), "free accounts never list or spend credits");
+	} finally {
+		await t.fire("session_shutdown");
+		backend.restore();
+	}
+});
+
+test("a paid Codex account that reopens within six hours asks first, and a refusal fails over once without re-asking", async () => {
+	const backend = fakeCodexResetBackend({ naturalResetInMs: 2 * 60 * 60 * 1000 });
+	const { t, prompts } = codexResetSetup({ codexResetCredits: "auto" }, async () => false);
+	try {
+		await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+		assert.equal(prompts.length, 1);
+		assert.match(prompts[0], /resets on its own in ~2h/);
+		assert.match(prompts[0], /2 banked reset/);
+		assert.equal(backend.seen.consumed.length, 0, "a refused prompt spends nothing");
+		assert.equal(t.rec.setModels[0], "openai-codex-account-2/gpt-5.5", "a refusal falls back to ordinary failover");
+
+		t.setCurrent("openai-codex", "gpt-5.5");
+		await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+		assert.equal(prompts.length, 1, "the same exhaustion must not ask twice");
+	} finally {
+		await t.fire("session_shutdown");
+		backend.restore();
+	}
+});
+
+test("an accepted prompt spends the reset and keeps the paid account", async () => {
+	const backend = fakeCodexResetBackend({ naturalResetInMs: 2 * 60 * 60 * 1000 });
+	const { t, prompts } = codexResetSetup({ codexResetCredits: "auto" }, async () => true);
+	try {
+		await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+		assert.equal(prompts.length, 1);
+		assert.equal(backend.seen.consumed.length, 1);
+		assert.deepEqual(t.rec.setModels, []);
+	} finally {
+		await t.fire("session_shutdown");
+		backend.restore();
+	}
+});
+
+test("a paid account already known to be spent is reset during prompt preflight before any request goes out", async () => {
+	const backend = fakeCodexResetBackend({ naturalResetInMs: 3 * 86_400_000 });
+	const { t } = codexResetSetup({ codexResetCredits: "auto" });
+	try {
+		await t.fire("session_start");
+		await t.command("limits refresh");
+		assert.ok(t.readState().exhaustedUntilByProvider?.["openai-codex"], "the usage reading benches the spent account");
+		await t.input("keep going");
+		assert.equal(backend.seen.consumed.length, 1);
+		assert.deepEqual(t.rec.setModels, [], "preflight keeps the reset paid account instead of routing to the free one");
+	} finally {
+		await t.fire("session_shutdown");
+		backend.restore();
+	}
+});
+
+test("reset credits stay untouched when the setting is off, when no UI can confirm, and on free accounts", async () => {
+	{
+		const backend = fakeCodexResetBackend({ naturalResetInMs: 3 * 86_400_000 });
+		const { t } = codexResetSetup({});
+		try {
+			await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+			assert.equal(backend.seen.creditLists.length + backend.seen.consumed.length, 0, "off is the default");
+			assert.equal(t.rec.setModels[0], "openai-codex-account-2/gpt-5.5");
+		} finally {
+			await t.fire("session_shutdown");
+			backend.restore();
+		}
+	}
+	{
+		const backend = fakeCodexResetBackend({ naturalResetInMs: 3 * 86_400_000 });
+		const { t } = codexResetSetup({ codexResetCredits: "ask" });
+		try {
+			await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+			assert.equal(backend.seen.consumed.length, 0, "ask without a dialog never spends");
+			assert.ok(t.rec.notifies.some((message) => /use-reset openai-codex/.test(message)));
+		} finally {
+			await t.fire("session_shutdown");
+			backend.restore();
+		}
+	}
+	{
+		const backend = fakeCodexResetBackend({ naturalResetInMs: 3 * 86_400_000, freeExhausted: true });
+		const { t } = codexResetSetup({ codexResetCredits: "auto" });
+		try {
+			t.setCurrent("openai-codex-account-2", "gpt-5.5");
+			await finishError(t, "openai-codex-account-2", "gpt-5.5", "429 usage_limit_reached");
+			assert.equal(backend.seen.consumed.length, 0, "a free account never spends its credits");
+			assert.ok(!backend.seen.creditLists.includes("free-acct"));
+		} finally {
+			await t.fire("session_shutdown");
+			backend.restore();
+		}
+	}
+});
+
+test("/multi-account use-reset spends a paid account's credit on request", async () => {
+	const backend = fakeCodexResetBackend({ naturalResetInMs: 60 * 60 * 1000 });
+	const { t } = codexResetSetup({});
+	try {
+		await t.command("use-reset openai-codex-account-2");
+		assert.equal(backend.seen.consumed.length, 0, "free accounts are refused even on request");
+		await t.command("use-reset");
+		assert.deepEqual(backend.seen.consumed.map((call) => call.body.credit_id), ["pro-acct-soonest"]);
+		await t.command("use-reset");
+		assert.equal(backend.seen.consumed.length, 1, "a recovered account is never reset again");
+	} finally {
+		await t.fire("session_shutdown");
+		backend.restore();
+	}
+});

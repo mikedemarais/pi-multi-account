@@ -36,7 +36,17 @@ import { mergeStateDeltas, mutateStateFile } from "./state-file-transaction.ts";
 import { normalizeModelPins, persistModelPin, validModelPinScope } from "./model-pins.ts";
 import { assertOpenAIChatGPTConfiguration, cloneOpenAIChatGPTProvider, isOpenAIChatGPTCredential, OPENAI_CHATGPT_URL, supportsOpenAIChatGPT } from "./openai-chatgpt.ts";
 import { mutateConfigFile } from "./config-file-transaction.ts";
-import { createHash } from "node:crypto";
+import {
+	codexExhaustion,
+	decideCodexReset,
+	fetchCodexResetCredits,
+	isPaidCodexPlan,
+	normalizeCodexResetCreditsMode,
+	redeemCodexResetCredit,
+	soonestExpiringCredit,
+	type CodexResetCreditsMode,
+} from "./codex-reset-credits.ts";
+import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import {
 	accessSync,
@@ -462,6 +472,18 @@ type ProviderFailoverConfig = {
 	// all forecasts, not facts. The only fact is what the account answers when asked. Default: 10
 	// minutes. Set higher to probe less often, never to "trust" a provider's own estimate.
 	maxRecheckIntervalMs?: number;
+	/**
+	 * Spend a banked Codex rate-limit reset credit when a PAID Codex account is exhausted, before
+	 * failing over to another account. Free-plan accounts never spend their credits.
+	 *  - "off"  (default): never spend a credit.
+	 *  - "ask":  always confirm in the chat first.
+	 *  - "auto": spend the soonest-expiring credit without asking, unless the account reopens on its
+	 *            own within `codexResetCreditMinNaturalResetMs`; then confirm first.
+	 * A refused or unanswerable confirmation fails over exactly as before.
+	 */
+	codexResetCredits?: "off" | "ask" | "auto";
+	/** `auto` asks instead of spending when the natural reset is nearer than this. Default: 6 hours. */
+	codexResetCreditMinNaturalResetMs?: number;
 	// Rewrite the interrupted turn into a verbatim `user` handoff record so the account
 	// taking over still sees exactly where the previous one stopped. Without this, pi-ai
 	// drops the interrupted assistant message entirely before the next request is built,
@@ -578,6 +600,8 @@ type RuntimeConfig = Required<
 	contextGuard: ContextGuardSettings;
 	/** Source-preserving emergency recovery, separate from proactive elision. */
 	recoverLargeContext: boolean;
+	codexResetCredits: CodexResetCreditsMode;
+	codexResetCreditMinNaturalResetMs: number;
 };
 
 type SwitchRecord = {
@@ -1073,6 +1097,8 @@ const MAX_LIVE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 // may prevent us from simply asking the account again. A rejected request costs no tokens, so
 // re-asking is close to free; only a successful one proves availability.
 const MAX_RECHECK_INTERVAL_MS = 10 * 60 * 1000;
+/** A Codex account that reopens on its own sooner than this asks before spending a reset credit. */
+const DEFAULT_CODEX_RESET_MIN_NATURAL_RESET_MS = 6 * 60 * 60 * 1000;
 const MIN_PENDING_WAKE_MS = 1000;
 // The usage-% endpoint tracks an account's QUOTA window; it does NOT reflect session/rate limits.
 // So a session-limited account keeps 429ing "usage limit reached" while usage still reports
@@ -1750,6 +1776,8 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	ignoreErrorPatterns: DEFAULT_IGNORE_PATTERNS,
 	continuationPrompt: DEFAULT_CONTINUATION_PROMPT,
 	maxRecheckIntervalMs: MAX_RECHECK_INTERVAL_MS,
+	codexResetCredits: "off",
+	codexResetCreditMinNaturalResetMs: DEFAULT_CODEX_RESET_MIN_NATURAL_RESET_MS,
 	contextGuard: false,
 	recoverLargeContext: true,
 	continueAfterCompaction: true,
@@ -1960,6 +1988,11 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		maxRecheckIntervalMs: positiveOr(
 			raw.maxRecheckIntervalMs,
 			MAX_RECHECK_INTERVAL_MS,
+		),
+		codexResetCredits: normalizeCodexResetCreditsMode(raw.codexResetCredits),
+		codexResetCreditMinNaturalResetMs: positiveOr(
+			raw.codexResetCreditMinNaturalResetMs,
+			DEFAULT_CODEX_RESET_MIN_NATURAL_RESET_MS,
 		),
 		contextGuard: normalizeContextGuard(raw.contextGuard),
 		recoverLargeContext: raw.recoverLargeContext === undefined || raw.recoverLargeContext === true,
@@ -7491,6 +7524,160 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		return false;
 	}
 
+	// ----- Codex rate-limit reset credits ----------------------------------
+
+	/** One redemption attempt per account at a time, shared by preflight and error handling. */
+	const codexResetAttempts = new Map<string, Promise<boolean>>();
+	/** A declined prompt is remembered per natural reset, so one exhaustion asks only once. */
+	const declinedCodexResetUntil = new Map<string, number>();
+
+	/**
+	 * Spend a banked Codex reset credit on an exhausted PAID account so work stays on it instead
+	 * of failing over (free accounts are the last resort). Returns true only after the server
+	 * confirms the reset; every other outcome leaves ordinary failover in charge.
+	 *
+	 * The account is re-read from its usage endpoint before anything is spent, and again after a
+	 * confirmation (which may have waited minutes, while another Pi window redeemed), so a credit
+	 * is never spent on an account that has already recovered. The server's `nothing_to_reset`
+	 * answer is the final guard against two windows racing.
+	 */
+	function maybeRedeemCodexResetCredit(ctx: any, provider: string | undefined): Promise<boolean> {
+		if (
+			!provider ||
+			config.codexResetCredits === "off" ||
+			usageFamily(provider) !== "codex" ||
+			isInvalidated(provider)
+		)
+			return Promise.resolve(false);
+		const cachedPlan = usageByProvider.get(provider)?.plan;
+		if (cachedPlan !== undefined && !isPaidCodexPlan(cachedPlan)) return Promise.resolve(false);
+		const existing = codexResetAttempts.get(provider);
+		if (existing) return existing;
+		const attempt = attemptCodexResetCredit(ctx, provider)
+			.catch((error) => {
+				logEvent("codex_reset_error", {
+					provider,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return false;
+			})
+			.finally(() => codexResetAttempts.delete(provider));
+		codexResetAttempts.set(provider, attempt);
+		return attempt;
+	}
+
+	async function readCodexExhaustion(ctx: any, provider: string) {
+		const snapshot = await fetchFreshUsage(ctx, provider);
+		storeUsage(ctx, snapshot);
+		return { snapshot, ...codexExhaustion(snapshot) };
+	}
+
+	async function attemptCodexResetCredit(ctx: any, provider: string): Promise<boolean> {
+		const skip = (reason: string) => {
+			logEvent("codex_reset_skipped", { provider, reason });
+			return false;
+		};
+		let usage = await readCodexExhaustion(ctx, provider);
+		if (!usage.exhausted) return skip("account is not exhausted");
+		if (!isPaidCodexPlan(usage.snapshot.plan)) return skip(`plan ${usage.snapshot.plan ?? "unknown"} keeps its credits`);
+		const declinedUntil = declinedCodexResetUntil.get(provider);
+		if (declinedUntil !== undefined && declinedUntil > Date.now() &&
+			(usage.naturalResetAt === undefined || usage.naturalResetAt <= declinedUntil))
+			return skip("declined for this exhaustion");
+		const entry = readAuthFile()[provider];
+		if (!entry?.access) return skip("no OAuth access token");
+		const list = await fetchCodexResetCredits(entry);
+		const credit = soonestExpiringCredit(list);
+		const decision = decideCodexReset({
+			mode: config.codexResetCredits,
+			plan: usage.snapshot.plan,
+			exhausted: usage.exhausted,
+			credit,
+			naturalResetAt: usage.naturalResetAt,
+			minNaturalResetMs: config.codexResetCreditMinNaturalResetMs,
+		});
+		if (decision.action === "skip") return skip(decision.reason);
+		const label = `${providerUsageLabel(provider)} (${usage.snapshot.plan})`;
+		const remaining = Math.max(list.availableCount, 1);
+		if (decision.action === "ask") {
+			const natural = usage.naturalResetAt
+				? `It resets on its own in ~${formatUntil(usage.naturalResetAt)}.`
+				: "Its natural reset time is unknown.";
+			const expiry = credit?.expiresAt
+				? ` The soonest-expiring one expires ${new Date(credit.expiresAt).toLocaleDateString()}.`
+				: "";
+			if (ctx?.hasUI === false || typeof ctx?.ui?.confirm !== "function") {
+				ctx?.ui?.notify?.(
+					`pi-multi-account: ${label} is out of usage. ${natural} Not spending one of ${remaining} banked reset(s) without confirmation; run /multi-account use-reset ${provider} to spend one.`,
+					"warning",
+				);
+				return skip(`${decision.reason}; no UI to confirm`);
+			}
+			logEvent("codex_reset_prompt", { provider, reason: decision.reason, naturalResetAt: usage.naturalResetAt ?? null });
+			const accepted = await ctx.ui.confirm(
+				"Use a banked Codex usage reset?",
+				`${label} is out of usage. ${natural} You have ${remaining} banked reset(s).${expiry} Use one now? Choosing no fails over to the other accounts.`,
+			);
+			if (!accepted) {
+				declinedCodexResetUntil.set(provider, usage.naturalResetAt ?? Date.now() + config.maxRecheckIntervalMs);
+				return skip("declined");
+			}
+			usage = await readCodexExhaustion(ctx, provider);
+			if (!usage.exhausted) return skip("account recovered while waiting for confirmation");
+		}
+		return spendCodexResetCredit(ctx, provider, credit?.id, label, remaining - 1);
+	}
+
+	async function spendCodexResetCredit(
+		ctx: any,
+		provider: string,
+		creditId: string | undefined,
+		label: string,
+		remainingAfter: number,
+	): Promise<boolean> {
+		const entry = readAuthFile()[provider];
+		if (!entry?.access) return false;
+		const result = await redeemCodexResetCredit(entry, { redeemRequestId: randomUUID(), creditId });
+		logEvent("codex_reset_consume", { provider, code: result.code, windowsReset: result.windowsReset });
+		if (result.code !== "reset" && result.code !== "already_redeemed") {
+			ctx?.ui?.notify?.(
+				result.code === "nothing_to_reset"
+					? `pi-multi-account: ${label} did not need a reset; no credit was spent.`
+					: `pi-multi-account: ${label} has no usable reset credit.`,
+				"info",
+			);
+			return false;
+		}
+		// The account's limits are gone server-side. Drop every local bench that recorded them —
+		// across sibling slots of the same real account — before re-reading usage as proof.
+		for (const candidate of providersSharingAccount(provider)) {
+			// The pre-reset reading says "spent"; sibling slots re-read on their own next refresh.
+			usageByProvider.delete(candidate);
+			exhaustedUntilByProvider.delete(candidate);
+			limitRefusalByProvider.delete(candidate);
+			limitStreakByProvider.delete(candidate);
+			usageUntrustedUntilByProvider.delete(candidate);
+			usageRetryAtByProvider.delete(candidate);
+			for (const key of [...exhaustedUntilByModel.keys()])
+				if (key.startsWith(`${candidate}/`)) exhaustedUntilByModel.delete(key);
+		}
+		declinedCodexResetUntil.delete(provider);
+		persist();
+		try {
+			storeUsage(ctx, await fetchFreshUsage(ctx, provider));
+		} catch (error) {
+			logEvent("codex_reset_usage_unconfirmed", {
+				provider,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		ctx?.ui?.notify?.(
+			`pi-multi-account: used a banked Codex reset on ${label}; staying on it. ${Math.max(remainingAfter, 0)} reset(s) left.`,
+			"info",
+		);
+		return true;
+	}
+
 	async function switchToFallback(
 		ctx: any,
 		failedModel: any,
@@ -7510,6 +7697,20 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		const switchEpoch = chainEpoch;
 		if (!automaticFailoverEnabled() || !failedModel?.provider || !failedModel?.id)
 			return false;
+
+		// A paid Codex account with a banked reset stays put: spend the reset rather than leave it.
+		// Once the reset is confirmed the account is NOT benched, whether or not a same-account
+		// continuation can be armed — failing over to a just-reset account would waste the credit.
+		if (
+			!options.manual &&
+			options.waitForQuotaRecovery &&
+			options.scope !== "model" &&
+			(await maybeRedeemCodexResetCredit(ctx, failedModel.provider))
+		) {
+			if (switchEpoch === chainEpoch && !sessionClosed)
+				armSameAccountResumeIfReady(ctx, failedModel, `${reason}; used a banked Codex reset`);
+			return false;
+		}
 
 		if (options.scope === "model") {
 			markModelExhausted(failedModel, cooldownMs);
@@ -7851,6 +8052,13 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			markFailoverPinUsed(ctx.model?.provider);
 			return true;
 		}
+		// The selected paid Codex account is known spent before any request went out: spend a
+		// banked reset on it before routing this prompt to another account.
+		if (
+			(await maybeRedeemCodexResetCredit(ctx, ctx.model?.provider)) &&
+			isCurrentModelReady(ctx)
+		)
+			return true;
 		const candidates = findFallbackModels(ctx, ctx.model, {
 			availableNowOnly: true,
 			includeCurrent: true,
@@ -10109,6 +10317,35 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			}
 			return;
 		}
+		if (command === "use-reset") {
+			// Typing the command is the confirmation, so this spends even when codexResetCredits is
+			// off or the natural reset is near. The paid-plan and exhausted-account guards still hold.
+			const provider = arg1?.trim() || ctx.model?.provider;
+			if (!provider || usageFamily(provider) !== "codex") {
+				ctx.ui.notify("pi-multi-account: usage: /multi-account use-reset [codex-provider]", "warning");
+				return;
+			}
+			const usage = await readCodexExhaustion(ctx, provider);
+			const label = `${providerUsageLabel(provider)} (${usage.snapshot.plan ?? "unknown plan"})`;
+			if (!isPaidCodexPlan(usage.snapshot.plan)) {
+				ctx.ui.notify(`pi-multi-account: ${label} is not a paid plan; its reset credits are never spent.`, "warning");
+				return;
+			}
+			if (!usage.exhausted) {
+				ctx.ui.notify(`pi-multi-account: ${label} still has usage; no reset credit was spent.`, "info");
+				return;
+			}
+			const entry = readAuthFile()[provider];
+			const list = entry?.access ? await fetchCodexResetCredits(entry) : undefined;
+			const credit = list ? soonestExpiringCredit(list) : undefined;
+			if (!list || !credit) {
+				ctx.ui.notify(`pi-multi-account: ${label} has no banked reset credit.`, "warning");
+				return;
+			}
+			if (await spendCodexResetCredit(ctx, provider, credit.id, label, list.availableCount - 1))
+				logEvent("codex_reset_manual", { provider });
+			return;
+		}
 		if (command === "revive") {
 			const target = arg1?.trim();
 			if (!target) {
@@ -10753,7 +10990,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 				// was the only way anyone found to reach a chosen account.
 				`Switch accounts: /multi-account best — jump straight to an account that can work now · /multi-account switch <provider> — e.g. /multi-account switch ${rotation.find((p) => p !== ctx.model?.provider) ?? rotation[0] ?? "<provider>"} · /multi-account next steps through the rotation in order`,
 				`Model pins: ${Object.entries(config.pinnedModels).map(([scope, id]) => `${scope}/${id}`).join(", ") || "none"} · /multi-account pins to inspect`,
-				`Other commands: status | accounts [refresh] | best | priority [...] | limits [refresh] | models | pick | pin <provider/model> | unpin <provider-or-family> | pins [list] | save-default | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | exclude <provider-id|provider-id/model-id> | include <provider-id|provider-id/model-id> | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
+				`Other commands: status | accounts [refresh] | best | priority [...] | limits [refresh] | models | pick | pin <provider/model> | unpin <provider-or-family> | pins [list] | save-default | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | exclude <provider-id|provider-id/model-id> | include <provider-id|provider-id/model-id> | revive <provider|all> | use-reset [codex-provider] | clear | stop | reset | reload | enable | disable`,
 			].join("\n"),
 			"info",
 		);

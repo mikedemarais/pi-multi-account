@@ -11,6 +11,8 @@ Fork changes on top of upstream 1.27.0.
 
 ### Added
 
+- Banked Codex rate-limit reset credits (`codexResetCredits: "auto" | "ask"`, default `"off"`). An exhausted paid Codex account spends its soonest-expiring reset credit and keeps working instead of failing over, both when a request is refused and when prompt preflight already knows the account is spent. When the account would reopen on its own within `codexResetCreditMinNaturalResetMs` (6 h), Pi asks first; refusing fails over as before. Free-plan accounts never spend credits. `/multi-account use-reset [codex-provider]` spends one on request.
+
 - Claude Sonnet 5.5 (`claude-sonnet-5-5`): Anthropic documents it for on-demand compaction, so native compaction now covers it.
 
 - Optional Anthropic native compaction (`anthropicNativeCompaction: true`, adapted from pi-anthropic-compat). On direct Claude API slots with a documented model, compaction asks Anthropic for a signed summary (`compact-2026-09-04`); its plain text becomes the entry summary, so other models and accounts keep reading ordinary text, and later requests from the same slot and model replay the signed block. Context recovery still owns compaction when the current account is not ready.

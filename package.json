@@ -60,6 +60,7 @@
     "antigravity",
     "docs/antigravity.md",
     "usage.ts",
+    "codex-reset-credits.ts",
     "cursor-bridge.ts",
     "cursor-model-name.ts",
     "compaction-summary.ts",
