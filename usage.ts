@@ -58,12 +58,12 @@ export type UsageCredential = {
 };
 
 /** Retry-After as milliseconds: delta-seconds or an HTTP date. */
-export function retryAfterHeaderMs(value: string | undefined, now = Date.now()): number | undefined {
+export function retryAfterHeaderMs(value: string | undefined): number | undefined {
 	if (!value) return undefined;
 	const seconds = Number(value);
 	if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
 	const dateMs = Date.parse(value);
-	return Number.isFinite(dateMs) ? Math.max(0, dateMs - now) : undefined;
+	return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : undefined;
 }
 
 export class UsageFetchError extends Error {

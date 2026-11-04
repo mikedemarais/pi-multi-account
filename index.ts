@@ -325,6 +325,7 @@ import {
 	mergeUsageSnapshot,
 	providerUsageLabel,
 	remainingPercent,
+	retryAfterHeaderMs,
 	usageColor,
 	usageFamily,
 	UsageFetchError,
@@ -3355,16 +3356,6 @@ function patternMatch(text: string, patterns: string[]) {
 	return patterns.some((p) => p && lower.includes(p.toLowerCase()));
 }
 
-function retryAfterToMs(value: string | undefined) {
-	if (!value) return undefined;
-	const seconds = Number(value);
-	if (Number.isFinite(seconds) && seconds >= 0)
-		return Math.ceil(seconds * 1000);
-	const dateMs = Date.parse(value);
-	if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
-	return undefined;
-}
-
 function secondsToMs(value: string | undefined) {
 	if (!value) return undefined;
 	const seconds = Number(value);
@@ -3400,7 +3391,7 @@ function cooldownFromHeaders(headers: Record<string, string>) {
 	const get = (name: string) => normalized.get(name.toLowerCase());
 	const primaryUsed = percentValue(get("x-codex-primary-used-percent"));
 	const secondaryUsed = percentValue(get("x-codex-secondary-used-percent"));
-	const retryAfter = retryAfterToMs(get("retry-after"));
+	const retryAfter = retryAfterHeaderMs(get("retry-after"));
 	const primaryReset = firstDefinedMs([
 		secondsToMs(get("x-codex-primary-reset-after-seconds")),
 		unixSecondsToCooldownMs(get("x-codex-primary-reset-at")),
