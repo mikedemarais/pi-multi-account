@@ -4355,6 +4355,13 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		),
 	);
 
+	// Codex reset credits (see maybeRedeemCodexResetCredit). One redemption attempt per account
+	// at a time; a declined prompt holds until that exhaustion's natural reset; a skipped check
+	// is not repeated by every usage reading.
+	const codexResetAttempts = new Map<string, Promise<boolean>>();
+	const declinedCodexResetUntil = new Map<string, number>();
+	const codexResetSkippedAt = new Map<string, number>();
+
 	// An account the user picked by hand (`next` / `switch`), still owed its one attempt.
 	//
 	// Manual selection deliberately ignores the cooldown bookkeeping, because that bookkeeping is
@@ -5685,6 +5692,16 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		// reports the real reset from the live snapshot. Never benches an account with headroom
 		// (cooldownMsFromUsage returns 0 while the primary window is < 100%).
 		const blockMs = cooldownMsFromUsage(snapshot);
+		// A paid Codex account whose included usage is spent keeps answering from its credit
+		// balance, so no refusal may ever arrive to trigger a reset. Act on the reading itself,
+		// but only for the account this session is actually using.
+		if (
+			snapshot.family === "codex" &&
+			ctx?.model?.provider === snapshot.provider &&
+			codexExhaustion(snapshot).exhausted
+		)
+			runBackground("codex reset credit", ctx, () =>
+				maybeRedeemCodexResetCredit(ctx, snapshot.provider, { background: true }));
 		if (blockMs !== undefined && blockMs > 0) {
 			markExhausted(snapshot.provider, blockMs);
 		} else if (blockMs === 0) {
@@ -7526,11 +7543,6 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 
 	// ----- Codex rate-limit reset credits ----------------------------------
 
-	/** One redemption attempt per account at a time, shared by preflight and error handling. */
-	const codexResetAttempts = new Map<string, Promise<boolean>>();
-	/** A declined prompt is remembered per natural reset, so one exhaustion asks only once. */
-	const declinedCodexResetUntil = new Map<string, number>();
-
 	/**
 	 * Spend a banked Codex reset credit on an exhausted PAID account so work stays on it instead
 	 * of failing over (free accounts are the last resort). Returns true only after the server
@@ -7541,7 +7553,11 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	 * is never spent on an account that has already recovered. The server's `nothing_to_reset`
 	 * answer is the final guard against two windows racing.
 	 */
-	function maybeRedeemCodexResetCredit(ctx: any, provider: string | undefined): Promise<boolean> {
+	function maybeRedeemCodexResetCredit(
+		ctx: any,
+		provider: string | undefined,
+		options: { background?: boolean } = {},
+	): Promise<boolean> {
 		if (
 			!provider ||
 			config.codexResetCredits === "off" ||
@@ -7553,6 +7569,12 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		if (cachedPlan !== undefined && !isPaidCodexPlan(cachedPlan)) return Promise.resolve(false);
 		const existing = codexResetAttempts.get(provider);
 		if (existing) return existing;
+		const now = Date.now();
+		if ((declinedCodexResetUntil.get(provider) ?? 0) > now) return Promise.resolve(false);
+		// Every response from a credit-funded account re-reports the spent window. Re-check a
+		// skipped account at most once per recheck interval instead of once per request.
+		if (options.background && (codexResetSkippedAt.get(provider) ?? 0) > now - config.maxRecheckIntervalMs)
+			return Promise.resolve(false);
 		const attempt = attemptCodexResetCredit(ctx, provider)
 			.catch((error) => {
 				logEvent("codex_reset_error", {
@@ -7574,16 +7596,13 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 
 	async function attemptCodexResetCredit(ctx: any, provider: string): Promise<boolean> {
 		const skip = (reason: string) => {
+			codexResetSkippedAt.set(provider, Date.now());
 			logEvent("codex_reset_skipped", { provider, reason });
 			return false;
 		};
 		let usage = await readCodexExhaustion(ctx, provider);
 		if (!usage.exhausted) return skip("account is not exhausted");
 		if (!isPaidCodexPlan(usage.snapshot.plan)) return skip(`plan ${usage.snapshot.plan ?? "unknown"} keeps its credits`);
-		const declinedUntil = declinedCodexResetUntil.get(provider);
-		if (declinedUntil !== undefined && declinedUntil > Date.now() &&
-			(usage.naturalResetAt === undefined || usage.naturalResetAt <= declinedUntil))
-			return skip("declined for this exhaustion");
 		const entry = readAuthFile()[provider];
 		if (!entry?.access) return skip("no OAuth access token");
 		const list = await fetchCodexResetCredits(entry);
@@ -7662,6 +7681,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 				if (key.startsWith(`${candidate}/`)) exhaustedUntilByModel.delete(key);
 		}
 		declinedCodexResetUntil.delete(provider);
+		codexResetSkippedAt.delete(provider);
 		persist();
 		try {
 			storeUsage(ctx, await fetchFreshUsage(ctx, provider));
@@ -8281,7 +8301,8 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			const ctx = watchdogCtx;
 			// A tool (build/test/long bash) running silently for minutes is NOT stuck. Never
 			// abort real work — just re-check later.
-			if (toolInFlight > 0 || compactionObservation) {
+			// Waiting on a Codex reset decision (possibly the user's answer) is not a wedge either.
+			if (toolInFlight > 0 || compactionObservation || codexResetAttempts.size > 0) {
 				armStuckWatchdog();
 				return;
 			}
@@ -11850,12 +11871,18 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		return undefined;
 	});
 
-	safeOn("before_provider_request", (event: any, ctx?: any) =>
+	safeOn("before_provider_request", (event: any, ctx?: any) => {
 		// Replay a signed Anthropic summary first: subscription shaping below derives its billing
 		// value from the first user message, so it must see the final message list.
-		anthropicCompaction
+		const shape = () => anthropicCompaction
 			? anthropicCompaction.then((native) => shapeProviderRequest(event, ctx, native?.replay(event.payload, ctx)))
-			: shapeProviderRequest(event, ctx));
+			: shapeProviderRequest(event, ctx);
+		// While a reset for this Codex account is being decided (or the user is asked), hold its
+		// next request: sent now, it would be paid from the account's credit balance.
+		const provider = event?.request?.model?.provider ?? ctx?.model?.provider;
+		const pendingReset = typeof provider === "string" ? codexResetAttempts.get(provider) : undefined;
+		return pendingReset ? pendingReset.then(shape) : shape();
+	});
 
 	function shapeProviderRequest(event: any, ctx?: any, replayed?: unknown) {
 		const input = replayed ?? event.payload;

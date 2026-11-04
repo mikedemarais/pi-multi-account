@@ -15613,3 +15613,61 @@ test("/multi-account use-reset spends a paid account's credit on request", async
 		backend.restore();
 	}
 });
+
+function spentCodexHeaders(resetInMs: number) {
+	return {
+		"x-codex-plan-type": "pro",
+		"x-codex-primary-used-percent": "100",
+		"x-codex-primary-window-minutes": "10080",
+		"x-codex-primary-reset-at": String(Math.floor((Date.now() + resetInMs) / 1000)),
+		"x-codex-credits-has-credits": "true",
+		"x-codex-credits-balance": "62499.63",
+	};
+}
+
+async function waitFor(condition: () => boolean, label: string) {
+	for (let i = 0; i < 200 && !condition(); i++) await wait(5);
+	assert.ok(condition(), label);
+}
+
+test("a successful response that shows a paid account's included usage spent resets it before credits are drawn", async () => {
+	const backend = fakeCodexResetBackend({ naturalResetInMs: 3 * 86_400_000 });
+	const { t } = codexResetSetup({ codexResetCredits: "auto" });
+	try {
+		// Codex keeps answering from the credit balance, so this response succeeds.
+		await t.fire("after_provider_response", { status: 200, headers: spentCodexHeaders(3 * 86_400_000) });
+		await waitFor(() => backend.seen.consumed.length === 1, "the spent reading alone triggers the reset");
+		assert.deepEqual(t.rec.setModels, []);
+		await t.fire("after_provider_response", { status: 200, headers: spentCodexHeaders(3 * 86_400_000) });
+		await wait(30);
+		assert.equal(backend.seen.consumed.length, 1, "a stale header after the reset is answered by the server, not a second credit");
+	} finally {
+		await t.fire("session_shutdown");
+		backend.restore();
+	}
+});
+
+test("while the user is asked about a reset, the account's next request waits instead of spending credits", async () => {
+	const backend = fakeCodexResetBackend({ naturalResetInMs: 2 * 60 * 60 * 1000 });
+	let answer!: (value: boolean) => void;
+	const { t, prompts } = codexResetSetup({ codexResetCredits: "auto" }, () => new Promise<boolean>((resolve) => { answer = resolve; }));
+	try {
+		await t.fire("after_provider_response", { status: 200, headers: spentCodexHeaders(2 * 60 * 60 * 1000) });
+		await waitFor(() => prompts.length === 1, "a near natural reset asks");
+		let sent = false;
+		const request = Promise.resolve(t.beforeReq({ model: "gpt-5.5" })).then(() => { sent = true; });
+		await wait(30);
+		assert.equal(sent, false, "the request is held while the question is open");
+		answer(true);
+		await request;
+		assert.equal(backend.seen.consumed.length, 1, "the reset lands before the held request goes out");
+
+		// A stale spent reading after the reset re-checks live usage instead of asking again.
+		await t.fire("after_provider_response", { status: 200, headers: spentCodexHeaders(2 * 60 * 60 * 1000) });
+		await wait(30);
+		assert.equal(prompts.length, 1);
+	} finally {
+		await t.fire("session_shutdown");
+		backend.restore();
+	}
+});
