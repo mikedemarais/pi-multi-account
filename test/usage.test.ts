@@ -13,6 +13,7 @@ import {
 	xaiUserIdFromAccessToken,
 	XAI_SUBSCRIPTION_USAGE_URL,
 	parseCodexUsageHeaders,
+	parseAnthropicUsageHeaders,
 	mergeUsageSnapshot,
 	parseCursorCurrentPeriodUsage,
 	parseCursorSandUsage,
@@ -889,4 +890,25 @@ test("xAI usage fetch refuses to send a request without a JWT user id", async ()
 		/no user id/i,
 	);
 	assert.equal(called, false);
+});
+
+test("Anthropic unified rate-limit headers become 5h/7d windows and keep a window the response omits", () => {
+	const now = 1_800_000_000_000;
+	const fiveReset = now / 1000 + 3600, weekReset = now / 1000 + 5 * 86400;
+	const both = parseAnthropicUsageHeaders("anthropic-account-2", {
+		"anthropic-ratelimit-unified-5h-utilization": "0.25",
+		"anthropic-ratelimit-unified-5h-reset": String(fiveReset),
+		"anthropic-ratelimit-unified-7d-utilization": "0.92",
+		"anthropic-ratelimit-unified-7d-reset": String(weekReset),
+	}, now, "hash-a");
+	assert.deepEqual(both?.primary, { usedPercent: 25, resetAt: fiveReset * 1000, windowSeconds: 5 * 3600 });
+	assert.deepEqual(both?.secondary, { usedPercent: 92, resetAt: weekReset * 1000, windowSeconds: 7 * 86400 });
+
+	const onlyFive = { "anthropic-ratelimit-unified-5h-utilization": "0.5", "anthropic-ratelimit-unified-5h-reset": String(fiveReset) };
+	assert.deepEqual(parseAnthropicUsageHeaders("anthropic-account-2", onlyFive, now, "hash-a", both)?.secondary, both?.secondary,
+		"a response without the weekly window keeps the last weekly reading for the same token");
+	assert.equal(parseAnthropicUsageHeaders("anthropic-account-2", onlyFive, now, "hash-b", both)?.secondary, undefined,
+		"another token's weekly reading is not carried over");
+	assert.equal(parseAnthropicUsageHeaders("anthropic-account-2", { "anthropic-ratelimit-unified-7d-reset": String(weekReset) }, now), undefined,
+		"a reset without utilization is not a reading");
 });

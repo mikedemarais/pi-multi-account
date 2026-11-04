@@ -242,6 +242,40 @@ export function parseCodexUsageHeaders(
 	};
 }
 
+/**
+ * Claude subscription responses report the same 5h/7d windows as /api/oauth/usage in
+ * `anthropic-ratelimit-unified-*` headers, with utilization as a 0..1 fraction. Not every
+ * response carries both windows, so a missing one is kept from `previous` (same credential,
+ * reset still ahead) rather than dropped.
+ */
+export function parseAnthropicUsageHeaders(
+	provider: string,
+	headers: unknown,
+	fetchedAt = Date.now(),
+	credentialHash?: string,
+	previous?: UsageSnapshot,
+): UsageSnapshot | undefined {
+	const window = (name: string, windowSeconds: number): UsageWindow | undefined => {
+		const fraction = finiteNumber(headerValue(headers, `anthropic-ratelimit-unified-${name}-utilization`));
+		const resetAt = epochMs(headerValue(headers, `anthropic-ratelimit-unified-${name}-reset`));
+		if (fraction === undefined || resetAt === undefined) return undefined;
+		return { usedPercent: percent(fraction * 100)!, resetAt, windowSeconds };
+	};
+	const primary = window("5h", 5 * 60 * 60);
+	const secondary = window("7d", 7 * 24 * 60 * 60);
+	if (!primary && !secondary) return undefined;
+	const keep = (w: UsageWindow | undefined) =>
+		previous?.credentialHash === credentialHash && w && w.resetAt > fetchedAt ? w : undefined;
+	return {
+		provider,
+		family: "anthropic",
+		fetchedAt,
+		credentialHash,
+		primary: primary ?? keep(previous?.primary),
+		secondary: secondary ?? keep(previous?.secondary),
+	};
+}
+
 export function parseOllamaMeBody(
 	provider: string,
 	body: unknown,

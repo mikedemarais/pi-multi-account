@@ -321,6 +321,7 @@ import {
 	formatResetDuration,
 	formatUsageCompact,
 	formatUsageDetails,
+	parseAnthropicUsageHeaders,
 	parseCodexUsageHeaders,
 	mergeUsageSnapshot,
 	providerUsageLabel,
@@ -5624,12 +5625,23 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		persist();
 	}
 
+	/** Codex and Claude subscription responses carry the usage windows in their headers. */
+	function storeUsageFromHeaders(ctx: any, provider: string, headers: unknown) {
+		const family = usageFamily(provider);
+		if (family !== "codex" && family !== "anthropic") return;
+		const entry = readAuthFile()[provider];
+		const hash = entry ? credentialHash(entry) : undefined;
+		const snapshot = family === "codex"
+			? parseCodexUsageHeaders(provider, headers ?? {}, Date.now(), hash)
+			: parseAnthropicUsageHeaders(provider, headers ?? {}, Date.now(), hash, usageByProvider.get(provider));
+		if (snapshot) storeUsage(ctx, snapshot);
+	}
+
 	function storeUsage(ctx: any, snapshot: UsageSnapshot): boolean {
 		if (!usageSnapshotIsCurrent(snapshot)) return false;
 		snapshot = mergeUsageSnapshot(usageByProvider.get(snapshot.provider), snapshot);
 		usageByProvider.set(snapshot.provider, snapshot);
 		usageErrors.delete(snapshot.provider);
-		usageRetryAtByProvider.delete(snapshot.provider);
 		// AUTHORITATIVE PROACTIVE BENCH. If the account's own usage endpoint reports a hard block (a
 		// window at >=100% with a future reset), record the cooldown NOW — even if the account never
 		// threw a limit error and had no prior cooldown. Without this, a known-spent account (a
@@ -5735,6 +5747,8 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		usageFetches.set(provider, fetchPromise);
 		try {
 			const snapshot = await fetchPromise;
+			// Only the endpoint answering ends its backoff; header readings leave it in place.
+			usageRetryAtByProvider.delete(provider);
 			return storeUsage(ctx, snapshot) ? snapshot : undefined;
 		} catch (error) {
 			usageErrors.set(
@@ -13143,16 +13157,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			| undefined;
 		if (request?.kind === "background") {
 			const route = request.model;
-			if (route && usageFamily(route.provider) === "codex") {
-				const entry = readAuthFile()[route.provider];
-				const snapshot = parseCodexUsageHeaders(
-					route.provider,
-					(event as any).headers ?? {},
-					Date.now(),
-					entry ? credentialHash(entry) : undefined,
-				);
-				if (snapshot) storeUsage(ctx, snapshot);
-			}
+			if (route) storeUsageFromHeaders(ctx, route.provider, (event as any).headers);
 			return;
 		}
 		noteResumeProgress(); // a provider response arrived → the resumed turn is alive
@@ -13160,16 +13165,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		// included: whether a request reached a provider is a fact about the session, not
 		// something this extension's own settings get an opinion about.
 		noteProviderRequestObserved();
-		if (ctx.model && usageFamily(ctx.model.provider) === "codex") {
-			const entry = readAuthFile()[ctx.model.provider];
-			const snapshot = parseCodexUsageHeaders(
-				ctx.model.provider,
-				(event as any).headers ?? {},
-				Date.now(),
-				entry ? credentialHash(entry) : undefined,
-			);
-			if (snapshot) storeUsage(ctx, snapshot);
-		}
+		if (ctx.model) storeUsageFromHeaders(ctx, ctx.model.provider, (event as any).headers);
 		if (!automaticFailoverEnabled()) return;
 		const status = (event as any).status;
 		if (status < 400 && ctx.model) {

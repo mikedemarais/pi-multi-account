@@ -21,6 +21,8 @@ Fork changes on top of upstream 1.27.0.
 
 ### Fixed
 
+- Claude subscription slots record usage from every response's `anthropic-ratelimit-unified-5h/7d` headers, as Codex slots already did from `x-codex-*` headers. An account whose usage endpoint keeps refusing still gets a current 5h/7d reading once it is used. A response that omits one window keeps that window's last reading for the same token. Header readings do not end a usage-endpoint backoff.
+
 - A refusing usage endpoint is no longer retried by every Pi window on every status tick. An HTTP refusal now records a backoff in the shared state file (`usageRetryAtByProvider`): HTTP 429 waits for the server's `Retry-After` (at least one cache TTL, at most two hours), other HTTP errors wait one TTL, and every window and child honours it, including forced refreshes. Windows also adopt a sibling's newer usage snapshot from the state file instead of refetching. With many Pi windows open, an account without a cached snapshot used to be fetched by each window every minute, which kept Anthropic's usage endpoint answering 429, so the account never got a usage reading. A new login (different token) is not held back by the previous token's backoff, and a successful fetch clears it.
 
 - Anthropic native compaction reads the prompt cache. It now repeats the last foreground request's transcript (prompt, tool changes, earlier summary) up to the cut instead of rebuilding the prompt and tool list, which missed the cache from the first byte. In a live 160k-token Opus 5.5 session the summary request read 125k tokens from cache and wrote none; before, every native compaction wrote the whole range.

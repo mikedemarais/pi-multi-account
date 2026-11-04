@@ -15380,3 +15380,27 @@ test("a sibling's persisted usage backoff stops this process from fetching; a fr
 		fetches.restore();
 	}
 });
+
+test("a Claude response's rate-limit headers record usage without ending the usage-endpoint backoff", async () => {
+	const now = Date.now();
+	const provider = "anthropic-account-2";
+	const hash = createHash("sha256").update("a2-tok").digest("hex").slice(0, 12);
+	const t = setup({
+		accounts: { [provider]: { type: "oauth", access: "a2-tok", refresh: "a2-ref", expires: now + 86_400_000 } },
+		current: { provider, id: "claude-opus-4-8" },
+		config: { showUsage: false, autoDiscoverModels: false, autoContinue: false },
+		seedState: { stateVersion: 5, usageRetryAtByProvider: { [provider]: { retryAt: now + 600_000, credentialHash: hash, reason: "HTTP 429" } } },
+	});
+	try {
+		await t.fire("after_provider_response", { status: 200, headers: {
+			"anthropic-ratelimit-unified-5h-utilization": "0.1", "anthropic-ratelimit-unified-5h-reset": String(Math.floor(now / 1000) + 3600),
+			"anthropic-ratelimit-unified-7d-utilization": "0.3", "anthropic-ratelimit-unified-7d-reset": String(Math.floor(now / 1000) + 86400),
+		} });
+		const state = t.readState();
+		assert.equal(state.usageByProvider[provider]?.secondary?.usedPercent, 30);
+		assert.equal(state.usageByProvider[provider]?.credentialHash, hash);
+		assert.ok(state.usageRetryAtByProvider?.[provider], "header readings must not reopen a refusing usage endpoint");
+	} finally {
+		await t.fire("session_shutdown");
+	}
+});
