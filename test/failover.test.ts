@@ -15307,3 +15307,76 @@ for (const shadowed of [false, true]) test(`issue92: native refresh persists the
 		if (shadowed) assert.deepEqual(JSON.parse(readFileSync(AUTH, "utf8"))[provider], placeholder);
 	} finally { globalThis.fetch = oldFetch; await t.fire("session_shutdown"); writeProxyOAuthSidecar({}); }
 });
+
+// ---------------------------------------------------------------------------
+// Usage-endpoint backoff is shared across processes
+// ---------------------------------------------------------------------------
+
+function anthropicUsageFetch(responses: Array<() => Response>) {
+	let calls = 0;
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = (async (input: any) => {
+		assert.equal(String(input), "https://api.anthropic.com/api/oauth/usage");
+		const next = responses[Math.min(calls, responses.length - 1)];
+		calls++;
+		return next();
+	}) as typeof fetch;
+	return { calls: () => calls, restore: () => { globalThis.fetch = originalFetch; } };
+}
+
+test("usage 429 honours Retry-After and is persisted for sibling processes", async () => {
+	const provider = "anthropic-account-2";
+	const fetches = anthropicUsageFetch([
+		() => new Response("rate limited", { status: 429, headers: { "retry-after": "1800" } }),
+	]);
+	const t = setup({
+		accounts: { [provider]: { type: "oauth", access: "a2-tok", refresh: "a2-ref", expires: Date.now() + 86_400_000 } },
+		current: { provider, id: "claude-opus-4-8" },
+		config: { showUsage: false, autoDiscoverModels: false, autoContinue: false },
+	});
+	try {
+		await t.command("limits refresh");
+		await t.command("limits refresh");
+		assert.equal(fetches.calls(), 1, "a refused usage endpoint must not be asked again before Retry-After");
+		assert.match(t.rec.notifies.at(-1)!, /HTTP 429.*next check in/);
+		const retry = JSON.parse(readFileSync(STATE, "utf8")).usageRetryAtByProvider?.[provider];
+		assert.ok(retry, "the backoff must be written to the shared state file");
+		assert.ok(retry.retryAt >= Date.now() + 29 * 60_000 && retry.retryAt <= Date.now() + 31 * 60_000,
+			`Retry-After 1800s must set a ~30 minute wait; got ${retry.retryAt - Date.now()}ms`);
+	} finally {
+		await t.fire("session_shutdown");
+		fetches.restore();
+	}
+});
+
+test("a sibling's persisted usage backoff stops this process from fetching; a fresh login bypasses it", async () => {
+	const provider = "anthropic-account-2";
+	const entry = { type: "oauth" as const, access: "a2-tok", refresh: "a2-ref", expires: Date.now() + 86_400_000 };
+	const fetches = anthropicUsageFetch([
+		() => new Response(JSON.stringify({ five_hour: { utilization: 10, resets_at: new Date(Date.now() + 3600_000).toISOString() } }), { status: 200 }),
+	]);
+	const t = setup({
+		accounts: { [provider]: entry },
+		current: { provider, id: "claude-opus-4-8" },
+		config: { showUsage: false, autoDiscoverModels: false, autoContinue: false },
+	});
+	try {
+		const hash = createHash("sha256").update(entry.access).digest("hex").slice(0, 12);
+		const disk = existsSync(STATE) ? JSON.parse(readFileSync(STATE, "utf8")) : { stateVersion: 5 };
+		disk.usageRetryAtByProvider = { [provider]: { retryAt: Date.now() + 600_000, credentialHash: hash, reason: "HTTP 429" } };
+		writeFileSync(STATE, JSON.stringify(disk));
+		await t.command("limits refresh");
+		assert.equal(fetches.calls(), 0, "another window's backoff applies to this window too");
+
+		const auth = JSON.parse(readFileSync(AUTH, "utf8"));
+		auth[provider] = { ...entry, access: "a2-tok-after-login" };
+		writeFileSync(AUTH, JSON.stringify(auth));
+		await t.command("limits refresh");
+		assert.equal(fetches.calls(), 1, "a backoff recorded for another token must not block a new login");
+		assert.equal(JSON.parse(readFileSync(STATE, "utf8")).usageRetryAtByProvider?.[provider], undefined,
+			"a successful fetch clears the shared backoff");
+	} finally {
+		await t.fire("session_shutdown");
+		fetches.restore();
+	}
+});

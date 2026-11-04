@@ -588,6 +588,7 @@ type SwitchRecord = {
 type InvalidationRecord = { tokenHash: string; at: number; reason: string };
 
 type LimitRefusalEvidence = { observedAt: number; retryAt: number; reportedUntil?: number };
+type UsageRetryRecord = { retryAt: number; credentialHash?: string; reason: string };
 
 type ProviderFailoverState = {
 	stateVersion?: number;
@@ -603,6 +604,13 @@ type ProviderFailoverState = {
 	// per session.
 	usageUntrustedUntilByProvider?: Record<string, number>;
 	usageByProvider?: Record<string, UsageSnapshot>;
+	/**
+	 * Earliest time any Pi process may call a provider's usage endpoint again after it refused.
+	 * Shared through the state file because every window and child polls independently: without
+	 * it, a refusing endpoint (Anthropic answers HTTP 429 with a long Retry-After) is retried by
+	 * every process on every status tick, which keeps the endpoint refusing indefinitely.
+	 */
+	usageRetryAtByProvider?: Record<string, UsageRetryRecord>;
 	codexModelCatalogByProvider?: Record<string, CodexCatalogSnapshot>;
 	pendingContinuationPrompt?: string;
 	pendingFrom?: ModelRef;
@@ -1044,6 +1052,9 @@ const DEFAULT_USAGE_STATUS_REFRESH_MS = 60 * 1000;
 const CODEX_MODEL_CATALOG_TTL_MS = 5 * 60 * 1000;
 const OLLAMA_MODEL_CATALOG_TTL_MS = 30 * 60 * 1000;
 const MIN_ANTHROPIC_USAGE_REFRESH_MS = 10 * 60 * 1000;
+// Upper bound on a usage-endpoint backoff, so a huge or bogus Retry-After cannot hide an
+// account's meter for long. Routing never depends on this wait: inference is unaffected.
+const MAX_USAGE_RETRY_MS = 2 * 60 * 60 * 1000;
 const MAX_MIGRATED_COOLDOWN_MS = 8 * 24 * 60 * 60 * 1000;
 // v1.13.7 — Hard ceiling on any LIVE-parsed cooldown. Codex/usage error bodies can report the
 // reset of a long ROLLING window (weekly/monthly) as `resets_at`, which — taken literally — evicts
@@ -4258,6 +4269,11 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	const usageByProvider = new Map<string, UsageSnapshot>(
 		Object.entries(persistedState.usageByProvider ?? {}),
 	);
+	const usageRetryAtByProvider = new Map<string, UsageRetryRecord>(
+		Object.entries(persistedState.usageRetryAtByProvider ?? {}).filter(
+			([, value]) => !!value && Number.isSafeInteger(value.retryAt),
+		),
+	);
 	const limitRefusalByProvider = new Map<string, LimitRefusalEvidence>(
 		Object.entries(persistedState.limitRefusalByProvider ?? {}).filter(([, value]) =>
 			!!value && Number.isSafeInteger(value.observedAt) && value.observedAt >= 0 &&
@@ -4835,6 +4851,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			),
 			limitRefusalByProvider: Object.fromEntries(limitRefusalByProvider.entries()),
 			usageByProvider: Object.fromEntries(usageByProvider.entries()),
+			usageRetryAtByProvider: Object.fromEntries(usageRetryAtByProvider.entries()),
 			codexModelCatalogByProvider: Object.fromEntries(
 				codexModelCatalogByProvider.entries(),
 			),
@@ -4913,6 +4930,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 				[usageUntrustedUntilByProvider, next.usageUntrustedUntilByProvider],
 				[limitRefusalByProvider, next.limitRefusalByProvider],
 				[usageByProvider, next.usageByProvider],
+				[usageRetryAtByProvider, next.usageRetryAtByProvider],
 				[codexModelCatalogByProvider, next.codexModelCatalogByProvider],
 			] as Array<[Map<string, any>, Record<string, any> | undefined]>) {
 				map.clear();
@@ -5542,11 +5560,85 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		return !!entry && (!snapshot.credentialHash || snapshot.credentialHash === credentialHash(entry));
 	}
 
+	/**
+	 * Adopt a sibling process's newer usage snapshot and usage-endpoint backoff from the shared
+	 * state file. In-memory maps otherwise see other windows' results only when this process next
+	 * persists, so each of N windows would refetch (or retry a refusing endpoint) on its own.
+	 */
+	function adoptSharedUsage(provider: string) {
+		// Record adopted values as the merge base too, so a later local change (a newer fetch, or
+		// clearing the backoff after success) is written over them rather than treated as no-op.
+		const adoptAsBase = <K extends "usageByProvider" | "usageRetryAtByProvider">(field: K, value: any) => {
+			lastSavedState = { ...lastSavedState, [field]: { ...(lastSavedState[field] ?? {}), [provider]: value } };
+		};
+		let disk: ProviderFailoverState;
+		try {
+			disk = JSON.parse(readFileSync(STATE_PATH, "utf8"));
+		} catch {
+			return;
+		}
+		const shared = disk?.usageByProvider?.[provider];
+		const local = usageByProvider.get(provider);
+		if (
+			shared &&
+			Number.isFinite(shared.fetchedAt) &&
+			shared.fetchedAt > (local?.fetchedAt ?? 0) &&
+			usageSnapshotIsCurrent(shared)
+		) {
+			usageByProvider.set(provider, shared);
+			adoptAsBase("usageByProvider", shared);
+			usageErrors.delete(provider);
+		}
+		const retry = disk?.usageRetryAtByProvider?.[provider];
+		if (
+			retry &&
+			Number.isSafeInteger(retry.retryAt) &&
+			retry.retryAt > (usageRetryAtByProvider.get(provider)?.retryAt ?? 0)
+		) {
+			usageRetryAtByProvider.set(provider, retry);
+			adoptAsBase("usageRetryAtByProvider", retry);
+		}
+	}
+
+	/** Active usage-endpoint backoff for the provider's current credential, if any. */
+	function usageRetryAt(provider: string, now = Date.now()): UsageRetryRecord | undefined {
+		const retry = usageRetryAtByProvider.get(provider);
+		if (!retry || retry.retryAt <= now) return undefined;
+		// A fresh login is a different token; let it ask immediately.
+		const entry = readAuthFile()[provider];
+		if (retry.credentialHash && entry && retry.credentialHash !== credentialHash(entry))
+			return undefined;
+		return retry;
+	}
+
+	/**
+	 * Record when the usage endpoint may be asked again after a refusal. HTTP 429 honours the
+	 * server's Retry-After; any other HTTP refusal waits one cache TTL. Network failures and
+	 * timeouts keep today's behaviour (retry on the next tick) because they are local and brief.
+	 */
+	function noteUsageFailure(provider: string, error: unknown) {
+		if (!(error instanceof UsageFetchError) || typeof error.status !== "number") return;
+		const ttl = usageCacheTtl(provider);
+		const waitMs = Math.min(
+			MAX_USAGE_RETRY_MS,
+			error.status === 429 ? Math.max(error.retryAfterMs ?? 0, ttl) : ttl,
+		);
+		const entry = readAuthFile()[provider];
+		usageRetryAtByProvider.set(provider, {
+			retryAt: Date.now() + waitMs,
+			credentialHash: entry ? credentialHash(entry) : undefined,
+			reason: `HTTP ${error.status}`,
+		});
+		logEvent("usage_backoff", { provider, status: error.status, waitMs });
+		persist();
+	}
+
 	function storeUsage(ctx: any, snapshot: UsageSnapshot): boolean {
 		if (!usageSnapshotIsCurrent(snapshot)) return false;
 		snapshot = mergeUsageSnapshot(usageByProvider.get(snapshot.provider), snapshot);
 		usageByProvider.set(snapshot.provider, snapshot);
 		usageErrors.delete(snapshot.provider);
+		usageRetryAtByProvider.delete(snapshot.provider);
 		// AUTHORITATIVE PROACTIVE BENCH. If the account's own usage endpoint reports a hard block (a
 		// window at >=100% with a future reset), record the cooldown NOW — even if the account never
 		// threw a limit error and had no prior cooldown. Without this, a known-spent account (a
@@ -5617,12 +5709,24 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			updateUsageStatus(ctx, provider);
 			return undefined;
 		}
+		adoptSharedUsage(provider);
 		const cached = cachedUsage(provider);
 		if (
 			!force &&
 			cached &&
 			Date.now() - cached.fetchedAt < usageCacheTtl(provider)
 		) {
+			updateUsageStatus(ctx, provider);
+			return cached;
+		}
+		// Even a forced refresh honours the backoff: forced callers include automatic cooldown
+		// reconciliation, and the endpoint has already said when it will answer again.
+		const retry = usageRetryAt(provider);
+		if (retry) {
+			usageErrors.set(
+				provider,
+				`${provider} usage endpoint refused (${retry.reason}); next check in ${formatDelay(retry.retryAt - Date.now())}`,
+			);
 			updateUsageStatus(ctx, provider);
 			return cached;
 		}
@@ -5646,6 +5750,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 				provider,
 				error instanceof Error ? error.message : String(error),
 			);
+			noteUsageFailure(provider, error);
 			updateUsageStatus(ctx, provider);
 			return cached;
 		} finally {
@@ -9512,6 +9617,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		limitStreakByProvider.delete(provider);
 		authFailures.delete(provider);
 		usageByProvider.delete(provider);
+		usageRetryAtByProvider.delete(provider);
 		usageErrors.delete(provider);
 		codexModelCatalogByProvider.delete(provider);
 		credentialHashes.delete(provider);
@@ -10068,6 +10174,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			invalidatedByProvider.clear();
 			authFailures.clear();
 			usageByProvider.clear();
+			usageRetryAtByProvider.clear();
 			usageErrors.clear();
 			codexModelCatalogByProvider.clear();
 			discoveredCodexModelOrder = [];
@@ -10121,6 +10228,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			responseCooldownHints.clear();
 			handledAssistantErrors.clear();
 			usageByProvider.clear();
+			usageRetryAtByProvider.clear();
 			usageErrors.clear();
 			clearPendingContinuation();
 			clearQueuedInputs();

@@ -57,13 +57,25 @@ export type UsageCredential = {
 	expires?: number;
 };
 
+/** Retry-After as milliseconds: delta-seconds or an HTTP date. */
+export function retryAfterHeaderMs(value: string | undefined, now = Date.now()): number | undefined {
+	if (!value) return undefined;
+	const seconds = Number(value);
+	if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
+	const dateMs = Date.parse(value);
+	return Number.isFinite(dateMs) ? Math.max(0, dateMs - now) : undefined;
+}
+
 export class UsageFetchError extends Error {
 	readonly status?: number;
+	/** Server-requested wait from a Retry-After header, when the endpoint sent one. */
+	readonly retryAfterMs?: number;
 
-	constructor(message: string, status?: number) {
+	constructor(message: string, status?: number, retryAfterMs?: number) {
 		super(message);
 		this.name = "UsageFetchError";
 		this.status = status;
+		this.retryAfterMs = retryAfterMs;
 	}
 }
 
@@ -926,7 +938,11 @@ export async function fetchUsageSnapshot(
 			signal: controller.signal,
 		});
 		if (!response.ok) {
-			throw new UsageFetchError(`${provider} usage endpoint returned HTTP ${response.status}`, response.status);
+			throw new UsageFetchError(
+				`${provider} usage endpoint returned HTTP ${response.status}`,
+				response.status,
+				retryAfterHeaderMs(response.headers?.get?.("retry-after") ?? undefined),
+			);
 		}
 		const body = await response.json();
 		const snapshot =

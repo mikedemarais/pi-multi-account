@@ -7,7 +7,7 @@ import { dirname } from "node:path";
 const require = createRequire(import.meta.url);
 const pause = new Int32Array(new SharedArrayBuffer(4));
 const MAP_FIELDS = ["exhaustedUntilByProvider", "exhaustedUntilByModel", "invalidatedByProvider",
-  "usageUntrustedUntilByProvider", "limitRefusalByProvider", "usageByProvider", "codexModelCatalogByProvider", "lastProbeAtByProvider"];
+  "usageUntrustedUntilByProvider", "limitRefusalByProvider", "usageByProvider", "usageRetryAtByProvider", "codexModelCatalogByProvider", "lastProbeAtByProvider"];
 type State = Record<string, any>;
 
 export function mergeStateDeltas<T extends State>(base: T, local: T, disk: T): T {
@@ -23,6 +23,8 @@ export function mergeStateDeltas<T extends State>(base: T, local: T, disk: T): T
         if ((field === "usageByProvider" || field === "codexModelCatalogByProvider") &&
             newer?.credentialHash === candidate?.credentialHash && newer?.fetchedAt > candidate?.fetchedAt) continue;
         if (field === "limitRefusalByProvider" && newer?.observedAt > candidate?.observedAt) continue;
+        // A sibling's later usage-endpoint backoff outlives this process's older one.
+        if (field === "usageRetryAtByProvider" && newer?.retryAt > candidate?.retryAt) continue;
         // A local shorten based on an older snapshot cannot roll back a newer sibling refusal.
         if (["exhaustedUntilByProvider", "usageUntrustedUntilByProvider"].includes(field) &&
             JSON.stringify(newer) !== JSON.stringify(before[key]) && newer > candidate) continue;
