@@ -2731,7 +2731,8 @@ function apexIdentity(modelId: string | undefined): "astra" | "fable" | undefine
 	if (!modelId) return undefined;
 	const id = modelId.trim().toLowerCase().replace(/^~/, "");
 	if (/(^|[/:-])gpt-6-astra(?:[-/:]|$)/.test(id) || /^gpt-6-astra(?:[-/:]|$)/.test(id)) return "astra";
-	if (/(^|[/:-])claude-fable-5(?:[.-]1)?(?:[-/:]|$)/.test(id) || /^claude-fable-5(?:[.-]1)?(?:[-/:]|$)/.test(id)) return "fable";
+	// Every Fable release is apex; the provider check below excludes uncalibrated aliases.
+	if (/(^|[/:-])claude-fable-\d+(?:[.-]\d+)?(?:[-/:]|$)/.test(id)) return "fable";
 	return undefined;
 }
 
@@ -2799,6 +2800,12 @@ const FABLE_MODEL_DEFS: Record<string, Record<string, unknown>> = {
 		name: "Claude Fable 5.1",
 		thinkingLevelMap: { off: null, xhigh: "xhigh", max: "max" },
 		cost: { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 },
+		compat: { supportsMidConvoEffort: true, forceAdaptiveThinking: true, supportsStrictTools: true },
+	},
+	"claude-fable-5-2": {
+		name: "Claude Fable 5.2",
+		thinkingLevelMap: { off: null, xhigh: "xhigh", max: "max" },
+		cost: { input: 8, output: 40, cacheRead: 0.2, cacheWrite: 10 },
 		compat: { supportsMidConvoEffort: true, forceAdaptiveThinking: true, supportsStrictTools: true },
 	},
 };
