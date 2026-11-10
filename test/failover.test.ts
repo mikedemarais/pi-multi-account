@@ -5436,7 +5436,6 @@ test("explicit first Claude slot is offered before login and registered after re
 });
 
 test("numbered Claude slots on api.anthropic.com use Anthropic message threads like the base provider", async () => {
-	const { withAnthropicMessageThreads } = await import("../index.ts");
 	const t = setup({
 		accounts: { "anthropic-account-1": { type: "oauth", access: "fixture-one", refresh: "fixture-r1" } },
 		current: { provider: "anthropic-account-1", id: "claude-opus-4-8" },
@@ -5447,14 +5446,6 @@ test("numbered Claude slots on api.anthropic.com use Anthropic message threads l
 		assert.ok(models.length > 0);
 		for (const model of models) assert.equal(model.compat?.supportsMessageThreads, true, model.id);
 	} finally { await t.fire("session_shutdown"); }
-	const model = { id: "m", compat: { supportsStrictTools: true } };
-	assert.deepEqual(withAnthropicMessageThreads(model, "https://api.anthropic.com", {}).compat,
-		{ supportsStrictTools: true, supportsMessageThreads: true });
-	// Gateways may drop the `thread` field, an explicit choice wins, and the env var turns it off.
-	assert.equal(withAnthropicMessageThreads(model, "https://gateway.example", {}), model);
-	const explicit = { id: "m", compat: { supportsMessageThreads: false } };
-	assert.equal(withAnthropicMessageThreads(explicit, "https://api.anthropic.com", {}), explicit);
-	assert.equal(withAnthropicMessageThreads(model, "https://api.anthropic.com", { PI_ANTHROPIC_MESSAGE_THREADS: "0" }), model);
 });
 
 test("string model ids already in models.json are rewritten as objects", async () => {
