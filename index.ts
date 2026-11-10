@@ -3053,6 +3053,20 @@ function anthropicRefresherFor(providerId: string) {
 		refreshAnthropicCredentials(credentials, signal, providerId);
 }
 
+/**
+ * Pi (1.5.1+) turns on Anthropic message threads only for the provider named `anthropic` on
+ * api.anthropic.com: each request sends only the new messages and the server continues from
+ * the previous reply. A numbered slot is the same endpoint under another name, so it opts in
+ * the same way. Pi keys a thread by session and hashes the provider into it, so a failover to
+ * another slot starts a new thread instead of continuing one another account owns.
+ * `PI_ANTHROPIC_MESSAGE_THREADS=0` keeps every request whole; an explicit compat value wins.
+ */
+export function withAnthropicMessageThreads(model: any, baseUrl: string, env = process.env) {
+	if (env.PI_ANTHROPIC_MESSAGE_THREADS === "0" || !baseUrl.includes("api.anthropic.com")) return model;
+	if (model.compat?.supportsMessageThreads !== undefined) return model;
+	return { ...model, compat: { ...model.compat, supportsMessageThreads: true } };
+}
+
 function registerAnthropicSlot(
 	pi: ExtensionAPI,
 	id: string,
@@ -3061,7 +3075,8 @@ function registerAnthropicSlot(
 	hostModels?: ReadonlyMap<string, any>,
 ) {
 	if (id === ANTHROPIC_BASE) return; // base provider: oauth + shaping registered in piMultiAccount()
-	const models = modelIds.map((m) => anthropicModelDef(m, id, hostModels?.get(m)));
+	const models = modelIds.map((m) =>
+		withAnthropicMessageThreads(anthropicModelDef(m, id, hostModels?.get(m)), baseUrl));
 	pi.registerProvider(id, {
 		name: `Claude Pro/Max (${id})`,
 		baseUrl,
