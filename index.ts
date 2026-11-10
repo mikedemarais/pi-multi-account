@@ -25,7 +25,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createPayloadStream, PAYLOAD_ADMISSION } from "./provider-payload-stream.ts";
+import { createPayloadStream, OWNED_PAYLOAD_STREAM, PAYLOAD_ADMISSION } from "./provider-payload-stream.ts";
 import { recoveryProjectionSupported } from "./recovery-session.ts";
 import { createRecoveryArchives, RECOVERY_DETAIL } from "./recovery-archive.ts";
 import { recoveryTools, RECOVERY_TOOL_NAMES } from "./recovery-tools.ts";
@@ -3923,7 +3923,25 @@ function rewriteDeveloperRoleToSystem(payload: unknown): boolean {
 	return changed;
 }
 
-const anthropicPayloadStream = createPayloadStream((payload) => shapeAnthropicOAuthPayload(payload));
+/**
+ * Pi core sends its own pinned `claude-cli/<version>` user-agent on Anthropic OAuth requests,
+ * and Anthropic rejects newer models (claude_code_version_too_old) when that version is too old.
+ * Advertise the same version as the billing header; Pi merges options.headers last.
+ */
+export function withClaudeCodeUserAgent(options: any = {}, version?: string) {
+	if (typeof options.apiKey !== "string" || !options.apiKey.includes("sk-ant-oat")) return options;
+	return {
+		...options,
+		headers: { ...options.headers, "user-agent": `claude-cli/${version ?? claudeCodeVersion()}` },
+	};
+}
+
+const shapeAnthropicStream = createPayloadStream((payload) => shapeAnthropicOAuthPayload(payload));
+const anthropicPayloadStream = Object.assign(
+	(model: any, context: any, options?: any) =>
+		shapeAnthropicStream(model, context, withClaudeCodeUserAgent(options)),
+	{ [OWNED_PAYLOAD_STREAM]: true },
+);
 const qwenPayloadStream = createPayloadStream((payload) => {
 	rewriteDeveloperRoleToSystem(payload);
 	return payload;

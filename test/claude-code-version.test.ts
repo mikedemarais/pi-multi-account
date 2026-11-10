@@ -74,6 +74,32 @@ test("a newer locally installed Claude Code wins over the constant, never an old
 	assert.equal(newerClaudeCodeVersion("2.1.281", "garbage"), "2.1.281");
 });
 
+// Anthropic gates new models on the claude-cli user-agent version (Fable 5.2 needs 2.1.290 while
+// Pi core pins 2.1.280), so the billing-header version alone is not enough.
+test("Anthropic OAuth requests advertise the billing-header Claude Code version in user-agent", async () => {
+	const { withClaudeCodeUserAgent } = await import("../index.ts");
+	const apiKeyOptions = { apiKey: "sk-ant-api03-x", headers: { a: "1" } };
+	assert.equal(withClaudeCodeUserAgent(apiKeyOptions, "9.9.9"), apiKeyOptions);
+
+	const { getApiProvider } = await import("@earendil-works/pi-ai/compat");
+	let userAgent: string | null = null;
+	const fetch = async (_url: any, init: any) => {
+		userAgent = new Headers(init?.headers).get("user-agent");
+		return new Response(JSON.stringify({ type: "error", error: { type: "x", message: "stop" } }), { status: 400 });
+	};
+	const model = {
+		id: "claude-fable-5-2", name: "x", api: "anthropic-messages", provider: "anthropic",
+		baseUrl: "https://api.anthropic.com", reasoning: false, input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 100,
+	};
+	const options = withClaudeCodeUserAgent({ apiKey: "sk-ant-oat01-x", fetch, maxRetries: 0 }, "9.9.9");
+	const stream = getApiProvider("anthropic-messages" as any)!.streamSimple(
+		model as any, { messages: [{ role: "user", content: "hi", timestamp: 0 }] } as any, options,
+	);
+	await stream.result();
+	assert.equal(userAgent, "claude-cli/9.9.9");
+});
+
 test("the version check never again depends on GitHub Actions opening a pull request", () => {
 	// Comments may name the old call — that is where the history is written down. Only what the
 	// runner actually executes counts.
