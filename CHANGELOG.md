@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Fork changes on top of upstream 1.27.0.
 
+### Fixed
+
+- Anthropic OAuth requests send `claude-cli/<version>` in the user-agent using the billing-header version (the newer of `CLAUDE_CODE_VERSION` and the installed `claude`). Pi 1.5.1 pins 2.1.280 there, and Anthropic rejects Claude Fable 5.2 below 2.1.290 with `claude_code_version_too_old`.
+
 ### Added
 
 - Numbered Claude slots (`anthropic-account-N`) on api.anthropic.com use Anthropic message threads, as Pi 1.5.1 does for its own `anthropic` provider: each request sends only the new messages and the server continues from the previous reply, with a full request after compaction, a tool or system prompt change, or a failover to another slot (Pi hashes the provider into the thread, so another account's thread is never continued). Pi enabled threads only for the provider named `anthropic`, so these slots always sent the whole conversation.
