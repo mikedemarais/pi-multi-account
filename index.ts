@@ -7548,9 +7548,14 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			}
 			restoreDesiredThinking(ctx);
 			recoveryContext = ctx;
-			if (recoveryEnabled(ctx) && (recoveryTarget || !Number.isFinite(sourceWindow) || fallback.contextWindow < sourceWindow)) {
+			// An automatic chain keeps the guard armed. An explicit switch to a window that is not
+			// smaller must not inherit it: after a failed recovery on a small fallback, the guard
+			// otherwise capped the owner's chosen 1M model at the 262,144-byte recovery budget and
+			// rejected every request.
+			const smaller = !Number.isFinite(sourceWindow) || fallback.contextWindow < sourceWindow;
+			if (recoveryEnabled(ctx) && (smaller || (recoveryTarget && !options.manual))) {
 				recoveryTarget = `${fallback.provider}/${fallback.id}`;
-			}
+			} else if (options.manual) recoveryTarget = undefined;
 			applyOnlyActiveFilter(ctx, fallback.provider);
 			setLastProbe(fallback.provider);
 			if (options.armContinuation !== false) {

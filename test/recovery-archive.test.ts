@@ -91,6 +91,17 @@ test("native preparation is complete, read-only, source-cited and bounded", { sk
 	assert.equal(result.isCurrent(), false);
 });
 
+test("preparation asks for a word target well below the byte limit", { skip: !supported }, async () => {
+	const session = make(); session.appendMessage({ role: "user", content: "Original task", timestamp: 1 });
+	const archive = createRecoveryArchives(() => session); let prompt = "";
+	await prepareNativeRecovery({ archives: archive, getSession: () => session, isCurrent: () => true,
+		model: { contextWindow: 272000 }, timeoutMs: 1000, protectedBytes: 150000,
+		generate: async request => { prompt = request.messages[0].content; return { text: "Continue the owned task.", stopReason: "stop", hasToolCalls: false }; } });
+	const [, words, bytes] = prompt.match(/at most (\d+) words; the hard limit is (\d+) UTF-8 bytes/) ?? [];
+	assert.ok(words && bytes, prompt);
+	assert.ok(Number(words) * 7 <= Number(bytes) * 0.6, `${words} words must leave room under ${bytes} bytes`);
+});
+
 test("deadline, cancelled or owner-changed preparation cannot expose a checkpoint", { skip: !supported }, async () => {
 	for (const mode of ["abort", "new_input", "deadline"] as const) {
 		const session = make(); session.appendMessage({ role: "user", content: "Original", timestamp: 1 });
