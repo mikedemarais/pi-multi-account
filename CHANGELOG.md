@@ -11,7 +11,7 @@ Fork changes on top of upstream 1.27.0.
 
 ### Fixed
 
-- Context recovery on a smaller failover model no longer stops with `recovery:response` because the summary is too long. The preparation prompt asked for "at most N UTF-8 bytes"; models do not count bytes, and GPT-6 Astra returned 20-21 KB against a 16 KB limit on real sessions, so every summary was refused. The prompt now asks for a word count at about 60% of the limit and keeps the byte limit as the validated bound; the same sessions then gave about 7.8 KB.
+- Context recovery on a smaller failover model no longer stops with `recovery:response` because the summary is too long. The preparation prompt asked for "at most N UTF-8 bytes"; models do not count bytes. In two tests on a real session, GPT-6 Astra returned 19.7 and 21.1 KB against a 16 KB limit, and both summaries were refused. The prompt now asks for a word count at about 60% of the limit and keeps the byte limit as the validated bound; on that session and one more, the summary was then about 7.8 KB.
 - An explicit `/multi-account switch` to a model whose window is not smaller no longer inherits the recovery payload guard from a failed automatic recovery. The guard capped the owner's chosen 1M-window model at the 262,144-byte recovery budget and rejected every request until the session restarted.
 - Anthropic OAuth requests send `claude-cli/<version>` in the user-agent using the billing-header version (the newer of `CLAUDE_CODE_VERSION` and the installed `claude`). Pi 1.5.1 pins 2.1.280 there, and Anthropic rejects Claude Fable 5.2 below 2.1.290 with `claude_code_version_too_old`.
 
