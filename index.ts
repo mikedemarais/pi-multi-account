@@ -2730,7 +2730,9 @@ function baseProviderId(provider: string | undefined): string {
 function apexIdentity(modelId: string | undefined): "astra" | "fable" | undefined {
 	if (!modelId) return undefined;
 	const id = modelId.trim().toLowerCase().replace(/^~/, "");
-	if (/(^|[/:-])gpt-6-astra(?:[-/:]|$)/.test(id) || /^gpt-6-astra(?:[-/:]|$)/.test(id)) return "astra";
+	// Every Astra release is apex (gpt-6-astra, gpt-6.2-astra, ...); the provider check below
+	// limits it to native OpenAI routes.
+	if (/(^|[/:-])gpt-\d+(?:\.\d+)?-astra(?:[-/:]|$)/.test(id)) return "astra";
 	// Every Fable release is apex; the provider check below excludes uncalibrated aliases.
 	if (/(^|[/:-])claude-fable-\d+(?:[.-]\d+)?(?:[-/:]|$)/.test(id)) return "fable";
 	return undefined;

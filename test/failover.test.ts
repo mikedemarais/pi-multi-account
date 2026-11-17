@@ -201,6 +201,9 @@ test("model identity folds Cursor effort suffixes and the cursor- prefix", () =>
 
 test("cross-provider quality bands quarantine Astra/Fable above ordinary frontier", () => {
 	assert.equal(modelQualityBand("gpt-6-astra", "openai-codex-account-2"), "apex");
+	assert.equal(modelQualityBand("gpt-6.2-astra", "openai-codex-account-1"), "apex");
+	assert.equal(modelQualityBand("openai/gpt-6.2-astra", "openai"), "apex");
+	assert.equal(modelQualityBand("gpt-6.2-sol", "openai-codex-account-1"), "frontier");
 	assert.equal(modelQualityBand("claude-fable-5-1", "anthropic-account-2"), "apex");
 	assert.equal(modelQualityBand("claude-fable-5-2", "anthropic-account-1"), "apex");
 	assert.equal(modelQualityBand("fable", "pi-claude-code-provider"), "apex");
