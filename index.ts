@@ -12869,6 +12869,9 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		if (recoveryEnabled(ctx) && archives.list().items.length) activateRecoveryTools();
 		const startEpoch = ++chainEpoch;
 		sessionClosed = false;
+		// No one types /model before a session starts: a selection made earlier came from a host
+		// extension restoring its default, and must not shield a spent account from startup routing.
+		manualPinnedProvider = undefined;
 		hostOwnsSessionModel = typeof ctx?.sessionManager?.getBranch === "function";
 		const rawSessionId = ctx?.sessionManager?.getSessionId?.();
 		const sessionId = typeof rawSessionId === "string" && rawSessionId.length > 0

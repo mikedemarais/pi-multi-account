@@ -11,6 +11,7 @@ Fork changes on top of upstream main after 1.28.1 (67379b4).
 
 ### Fixed
 
+- A model selected before `session_start`, such as a host extension restoring its default with `pi.setModel()`, no longer counts as the user's `/model` reprieve. Upstream 1.27.1 gave every native model selection a one-message reprieve, so a restored default whose account was spent stayed selected through the startup preflight. Each session start now clears the reprieve.
 - Every Astra release is in the apex quality band, not only `gpt-6-astra`. `gpt-6.2-astra` matched no quality band and so lost the apex quarantine.
 - Context recovery on a smaller failover model no longer stops with `recovery:response` because the summary is too long. The preparation prompt asked for "at most N UTF-8 bytes"; models do not count bytes. In two tests on a real session, GPT-6 Astra returned 19.7 and 21.1 KB against a 16 KB limit, and both summaries were refused. The prompt now asks for a word count at about 60% of the limit and keeps the byte limit as the validated bound; on that session and one more, the summary was then about 7.8 KB.
 - An explicit `/multi-account switch` to a model whose window is not smaller no longer inherits the recovery payload guard from a failed automatic recovery. The guard capped the owner's chosen 1M-window model at the 262,144-byte recovery budget and rejected every request until the session restarted.

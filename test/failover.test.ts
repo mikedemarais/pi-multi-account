@@ -10125,6 +10125,22 @@ test("the manual reprieve is spent after one attempt", async () => {
 	);
 });
 
+test("a model selected before session_start is not a manual reprieve", async () => {
+	// A host extension can restore the configured default with pi.setModel() before this
+	// package's session_start runs. That selection is not the user's /model, so it must not
+	// shield a spent account from the startup preflight.
+	const t = setup({
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
+	});
+	t.ctx.sessionManager = { getBranch: () => [] };
+	try {
+		await t.fire("model_select", { model: t.ctx.model, source: "set" });
+		await t.fire("session_start", {});
+		assert.notEqual(t.ctx.model.provider, "openai-codex-account-2", "startup must route around the spent account");
+	} finally { await t.fire("session_shutdown"); }
+});
+
 test("next says where it landed and whether that account is believed spent", async () => {
 	// It used to switch silently onto a cooled account and then be silently moved off it, so the
 	// user saw two switches and ended up somewhere they never chose. Saying it plainly costs
