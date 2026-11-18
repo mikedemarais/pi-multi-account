@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-Fork changes on top of upstream 1.27.0.
+Fork changes on top of upstream main after 1.28.1 (67379b4).
 
 ### Fixed
 
@@ -47,6 +47,51 @@ Fork changes on top of upstream 1.27.0.
 - Forced OAuth refreshes also run on Pi hosts that expose no AuthStorage to extensions (Pi 0.87 and later). Upstream reports them unsupported there; the fork runs upstream's fenced `auth.json` refresh transaction directly when that file is writable. A host that exposes a store without `modify()` is still refused.
 
 - The Anthropic OAuth billing header reports the locally installed Claude Code (`claude --version`) when it is newer than `CLAUDE_CODE_VERSION`, so a pinned install keeps working when a new model requires a newer client. Set `PI_MULTI_ACCOUNT_DETECT_CLAUDE_CODE_VERSION=0` to use only the constant.
+
+## [Unreleased]
+
+### Added
+
+- **Gemini 4 Carbon qualification and subscription guidance.** Account-discovered Carbon IDs retain their own metadata and signed tool replay; footer labels no longer confuse Carbon with Argon. Document AI Studio UI-only allowances, separate Gemini API billing/Cloud credits, and the unimplemented CLI integration boundary.
+
+- **Google Antigravity quota and limits in the status footer and `/multi-account limits`.** Antigravity now joins `usageFamily`, displaying live per-model quota windows and reset countdowns in Pi's status bar for the active model (e.g. Gemini and Claude quotas) and reporting full model quotas under `/multi-account limits`. Stored catalog metadata seeds the footer immediately on startup and offline, and live catalog refreshes update usage telemetry across account slots.
+
+### Fixed
+
+- Update the Claude Code billing-header version to npm's reviewed `2.1.322` release (issue #116), superseding the older version in the automated report.
+
+- **Avoid Gemini-only strict-sampling mutations for Antigravity Claude tools.** Claude rejects required strict sampling before dispatch and leaves preferred strict sampling disabled. Disjoint-type unions use the legacy bridge's `oneOf` representation; overlapping unions retain `anyOf` rather than silently narrowing valid input. These are adapter compatibility checks, not a guarantee that every upstream schema is supported.
+- **Keep unknown stored Antigravity quota unknown.** Only the raw protobuf response can imply zero from an omitted fraction; normalized catalog entries cannot. Unknown quota is no longer labelled unmetered or used to claim all models are exhausted.
+- **Bound failed context-recovery retries and improve diagnostics.** Allow one response repair within the existing pass/deadline budget, pause repeated automatic failures per summarizer, and preserve manual retry. Cap summary output headroom by model limits and report opaque Codex Bad Request without treating it as quota evidence.
+
+## [1.28.1] — 2026-11-02
+
+### Compatibility
+
+- Validate Pi 1.4.0 alongside supported older hosts; update development SDKs and accept native Responses `additional_tools` declarations in the image/tool/replay/cancellation canary without weakening schema checks.
+
+### Fixed
+
+- Resolve host-managed authentication before direct Codex catalog requests so expired OAuth tokens can refresh normally; re-read the stored credential and matching account ID instead of sending host-returned proxy placeholders. This does not change forced refresh for revoked tokens or proxy sidecars.
+
+## [1.28.0] — 2026-11-01
+
+### Added
+
+- Typing `/multi-account ` (or `/failover`, `/provider-failover`) now autocompletes subcommands with a one-line description each, and completes arguments for `switch`, `exclude`, `include`, `revive`, `add`, `remove`, `limits`, `accounts`, `priority`, `log` and `only-active`. Recovery suggestions use excluded/invalidated targets rather than the healthy rotation. Thanks to @kaiserbh (#105).
+
+### Fixed
+
+- Await an offline host registry refresh after startup slot publication, with shutdown/ownership rechecking, instead of relying on background registration refreshes (#101).
+- Update the Claude Code OAuth billing header version to 2.1.316 (#98).
+
+## [1.27.1] — 2026-10-27
+
+### Fixed
+
+- Native `/model` selections now receive the same one-message preflight reprieve as `/multi-account switch`, allowing an explicitly selected provider to retry after a stale cooldown.
+- Unmanaged API-key authentication failures are no longer mislabeled as quota exhaustion: explicit invalid-key refusals are credential-bound and recover when the key is replaced; generic 401s retain transient failure handling and actual quota refusals retain their cooldowns.
+- Antigravity translates nested tool-schema literals and numeric enums to Cloud Code Assist's protobuf schema representation, fixing HTTP 400 with the standard delegation repair tools. Error diagnostics identify rejected tool schemas without exposing provider response text.
 
 ## [1.27.0] — 2026-10-26
 

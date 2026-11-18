@@ -26,10 +26,11 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createPayloadStream, OWNED_PAYLOAD_STREAM, PAYLOAD_ADMISSION } from "./provider-payload-stream.ts";
+import { completeCommandArguments } from "./command-completions.ts";
 import { recoveryProjectionSupported } from "./recovery-session.ts";
 import { createRecoveryArchives, RECOVERY_DETAIL } from "./recovery-archive.ts";
 import { recoveryTools, RECOVERY_TOOL_NAMES } from "./recovery-tools.ts";
-import { prepareNativeRecovery, recoveryBudget, guardRecoveryCommit } from "./recovery-compaction.ts";
+import { prepareNativeRecovery, recoveryBudget, guardRecoveryCommit, RecoveryRetryGate, recoveryOutputTokenLimit } from "./recovery-compaction.ts";
 import { recoveryProviderAPI, hasRecoveryAdmission, type RecoveryProviderCoverage } from "./recovery-provider.ts";
 import { mutateProxyAuth, mutateProxyAuthAsync } from "./auth-file-transaction.ts";
 import { mergeStateDeltas, mutateStateFile } from "./state-file-transaction.ts";
@@ -326,11 +327,13 @@ import {
 	type CodexCatalogSnapshot,
 } from "./model-catalog.ts";
 import {
+	displayAntigravityUsageSnapshot,
 	fetchUsageSnapshot,
 	formatResetDuration,
 	formatUsageCompact,
 	formatUsageDetails,
 	parseAnthropicUsageHeaders,
+	parseAntigravityUsageBody,
 	parseCodexUsageHeaders,
 	mergeUsageSnapshot,
 	providerUsageLabel,
@@ -1130,7 +1133,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.27.0";
+const VERSION = "1.28.1";
 function sourceFingerprint(): string {
 	try {
 		const root = dirname(fileURLToPath(import.meta.url));
@@ -3638,7 +3641,7 @@ const MINIMAL_ANTHROPIC_OAUTH_PROMPT = [
 ].join("\n");
 const CLAUDE_CODE_IDENTITY_PREFIX =
 	"You are Claude Code, Anthropic's official CLI";
-const CLAUDE_CODE_VERSION = "2.1.296";
+const CLAUDE_CODE_VERSION = "2.1.322";
 const BILLING_HEADER_SALT = "59cf53e54c78";
 const BILLING_HEADER_POSITIONS = [4, 7, 20] as const;
 const CLAUDE_CODE_ENTRYPOINT = "sdk-cli";
@@ -4178,6 +4181,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	let recoveryTarget: string | undefined;
 	let recoveryController: AbortController | undefined;
 	let recoveryProvisional: string | undefined;
+	const recoveryRetryGate = new RecoveryRetryGate();
 	const recoveryProviders = new Map<string, RecoveryProviderCoverage>();
 	const recoverySourceWindows = new Map<string, number>();
 	const archives = createRecoveryArchives(() => {
@@ -5327,6 +5331,18 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		ctx: any,
 		provider: string,
 	): Promise<CodexCatalogModel[]> {
+		const registry = ctx?.modelRegistry;
+		const resolveAuth =
+			typeof registry?.getProviderAuth === "function"
+				? registry.getProviderAuth
+				: registry?.getApiKeyForProvider;
+		if (typeof resolveAuth === "function") {
+			// Let the host refresh expired OAuth under its own lock. Its result may be a
+			// loopback placeholder, so only the re-read parent credential goes upstream.
+			if (!(await resolveAuth.call(registry, provider))) {
+				throw new CodexCatalogFetchError(`${provider} has no resolved host authentication`);
+			}
+		}
 		let entry = readAuthFile()[provider];
 		if (!entry) throw new CodexCatalogFetchError(`${provider} has no stored credential`);
 		const runFetch = () =>
@@ -5552,10 +5568,15 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	}
 
 	// For display only: Qwen carries no usage windows, so swap its plan text for the live status.
-	function displayUsageSnapshot(snapshot: UsageSnapshot): UsageSnapshot {
-		return snapshot.family === "qwen"
-			? { ...snapshot, plan: qwenLiveStatus(snapshot.provider) }
-			: snapshot;
+	// Antigravity has per-model quotas, so specialize primary to the active model when available.
+	function displayUsageSnapshot(snapshot: UsageSnapshot, currentModelId?: string): UsageSnapshot {
+		if (snapshot.family === "qwen") {
+			return { ...snapshot, plan: qwenLiveStatus(snapshot.provider) };
+		}
+		if (snapshot.family === "antigravity") {
+			return displayAntigravityUsageSnapshot(snapshot, currentModelId);
+		}
+		return snapshot;
 	}
 
 	/**
@@ -5590,6 +5611,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			// blank footer, which is what the user saw when Codex's token rotated between usage fetches.
 			// Qwen may have no snapshot at all (nothing to fetch) — synthesize a bare one so its live
 			// availability/rate-limit status still shows.
+			// Antigravity seeds from its stored catalog so the footer is never blank on startup or offline.
 			const snapshot =
 				cachedUsage(provider) ??
 				usageByProvider.get(provider) ??
@@ -5600,12 +5622,20 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 							fetchedAt: Date.now(),
 							plan: "",
 						}
-					: undefined);
+					: usageFamily(provider) === "antigravity" && (readAuthFile()[provider] as any)?.catalog
+						? parseAntigravityUsageBody(
+								provider,
+								(readAuthFile()[provider] as any).catalog,
+								(readAuthFile()[provider] as any).catalogAt ?? Date.now(),
+								credentialHash(readAuthFile()[provider]),
+								(readAuthFile()[provider] as any).accountId,
+							)
+						: undefined);
 			if (!snapshot) {
 				ctx.ui.setStatus("multi-account-quota", undefined);
 				return;
 			}
-			const display = displayUsageSnapshot(snapshot);
+			const display = displayUsageSnapshot(snapshot, ctx?.model?.id);
 			const spare = readyElsewhereCount(ctx, provider);
 			const text = `${formatUsageCompact(display)} | ${
 				spare > 0 ? `+${spare} ready` : "no spare"
@@ -6419,6 +6449,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		const family = usageFamily(provider);
 		if (family === "xai") return readAuthFile()[provider]?.type === "oauth";
 		if (family === "zai-coding-cn") return readAuthFile()[provider]?.type === "api_key";
+		if (family === "antigravity") return readAuthFile()[provider]?.type === "oauth";
 		return (
 			family === "codex" ||
 			family === "anthropic" ||
@@ -8515,6 +8546,8 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			? ctx.model : config.routeCompactionToHealthyAccount ? compactionCandidates(ctx)[0] : undefined;
 		if (!model || typeof ctx.modelRegistry?.streamSimple !== "function")
 			return compactionCancelled("source recovery needs an available native summarizer; original history retained");
+		if (event?.reason !== "manual" && recoveryRetryGate.paused(ctx.sessionManager, model))
+			return compactionCancelled("source recovery paused after a failed automatic summary on this model; original history retained. A different summarizing model or manual /compact can start a new bounded attempt");
 		if (recoveryController) return compactionCancelled("source recovery already running");
 		const controller = new AbortController(), epoch = chainEpoch;
 		recoveryController = controller;
@@ -8541,7 +8574,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 							throw new Error("recovery:serialized_request_budget");
 					};
 					const message = await ctx.modelRegistry.streamSimple(model, request, {
-						signal, maxTokens: Math.min(model.maxTokens || 16384, 16384),
+						signal, maxTokens: recoveryOutputTokenLimit(model),
 						...(thinking ? { reasoning: thinking } : {}),
 						sessionId: ctx.sessionManager.getSessionId(), onPayload: admit, [PAYLOAD_ADMISSION]: admit,
 					}).result();
@@ -8560,6 +8593,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			logEvent("source_recovery_prepared", { passes: result.passes, pieces: result.acceptedPieces, archiveId: result.descriptor.archiveId });
 			return { compaction: guardRecoveryCommit({ summary: result.summary, firstKeptEntryId, tokensBefore: event.preparation.tokensBefore, details: result.details }, () => current() && result.isCurrent()) };
 		} catch (error) {
+			if (current() && !event.signal?.aborted) recoveryRetryGate.fail(ctx.sessionManager, model);
 			if (recoveryProvisional) { archives.discard(recoveryProvisional); recoveryProvisional = undefined; }
 			const reason = `Source recovery stopped; original history retained (${String(error instanceof Error ? error.message : error).slice(0, 180)})`;
 			ctx.ui?.notify?.(reason, "warning");
@@ -11077,6 +11111,11 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	for (const name of ["multi-account", "provider-failover", "failover"]) {
 		pi.registerCommand(name, {
 			description: "Manage automatic multi-account failover & rotation",
+			getArgumentCompletions: prefix => completeCommandArguments(prefix, {
+				rotation,
+				invalidated: [...invalidatedByProvider.keys()],
+				excluded: [...config.excludedProviders, ...config.excludedModels],
+			}),
 			handler: safeHandleCommand,
 		});
 	}
@@ -11614,6 +11653,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		}
 		recoveryProvisional = undefined;
 		recoveryController = undefined;
+		recoveryRetryGate.clear();
 		finishCompactionObservation("success");
 		contextGuardElided.clear();
 		contextGuardAccessFailure = undefined;
@@ -12820,6 +12860,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	safeOn("session_start", async (event, ctx) => {
 		recoveryController?.abort();
 		archives.close();
+		recoveryRetryGate.clear();
 		recoveryTarget = undefined;
 		recoveryProvisional = undefined;
 		recoveryController = undefined;
@@ -12917,6 +12958,11 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		await publishProxiedSlots(ctx);
 		if (!config.childProxy) activateSharedProxy();
 		publishOwnedNativeAliases(ctx);
+		// Publication changes models.json/auth.json after Pi loaded its provider config.
+		// Registration's background refresh is not a startup barrier: await the final
+		// disk snapshot before a placeholder-backed route can serve its first request.
+		await ctx.modelRegistry.refresh?.({ allowNetwork: false });
+		if (sessionClosed || chainEpoch !== startEpoch) return;
 		// Not installed → silent skip (refreshCursorSlots warns only on the explicit path).
 		if (config.includeCursor) await refreshCursorSlots(readAuthFile(), ctx);
 		applyOnlyActiveFilter(ctx);
@@ -13001,6 +13047,7 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 	safeOn("session_shutdown", async (_event, ctx) => {
 		recoveryController?.abort();
 		archives.close();
+		recoveryRetryGate.clear();
 		recoveryTarget = undefined;
 		finishCompactionObservation("shutdown");
 		clearRejectedCompactionWake();
@@ -13451,6 +13498,9 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		// Cancel stale pending work; if the selected model then returns a real limit, normal
 		// failover still applies to that completed request.
 		claimUserControl("manual model selection");
+		// Native /model must get the same one-message reprieve as /multi-account switch.
+		// A cached refusal is not evidence that the user's newly saved key still fails.
+		pinManualChoice(model.provider);
 		if (queuedUserInputs.length > 0) {
 			runBackground("manual model selection queued input resume", ctx, () =>
 				attemptQueuedInputResume(ctx),
@@ -13475,8 +13525,13 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 		const headerUsage = ctx.model
 			? storeUsageFromHeaders(ctx, ctx.model.provider, (event as any).headers)
 			: undefined;
-		if (!automaticFailoverEnabled()) return;
 		const status = (event as any).status;
+		if (Number.isInteger(status) && status >= 400 && status < 600 && ctx.model) {
+			// Response metadata is the evidence that a provider refused this request.
+			// Never infer the status from an opaque message body or log its private text.
+			logEvent("foreground_provider_http_failure", { status, provider: ctx.model.provider, model: ctx.model.id });
+		}
+		if (!automaticFailoverEnabled()) return;
 		if (status < 400 && ctx.model) {
 			noteProviderSuccessObserved();
 			noteAuthSuccess(ctx.model.provider, ctx.model.id);
@@ -13585,6 +13640,10 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			classified: failureKind,
 			error: errorText,
 		});
+		if (failureKind === "unhandled" && usageFamily(provider) === "codex" &&
+			/^\{\s*"detail"\s*:\s*"Bad Request"\s*\}$/i.test(errorText.trim())) {
+			ctx.ui?.notify?.("Codex returned an opaque Bad Request; this is not quota evidence. The server did not identify the rejected field. Avoid repeating the same request; choose a different model or compact the context.", "warning");
+		}
 
 		// Unmanaged active provider (e.g. plain `openai` API quota): we cannot manage its
 		// cooldown/refresh lifecycle, but we rescue the task by switching to a managed account on
@@ -13623,12 +13682,25 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			// how a session ended up answering every user message with the same "out of credits"
 			// error while live accounts sat unused. Transient blips and model-specific errors keep
 			// the light touch, because those genuinely are momentary or model-scoped.
+			if (failureKind === "auth" && !isRefreshable(provider)) {
+				// API-key rejection belongs to this credential, not a six-hour quota forecast.
+				// Persist its fingerprint so replacement also recovers across process restarts.
+				// DeepSeek places the masked key between "api key:" and "is invalid".
+				const explicitInvalidKey = /api[ -]?key\b[^\r\n]{0,256}\bis invalid\b/i.test(errorText);
+				const killed = explicitInvalidKey
+					? (markInvalid(provider, errorText), true)
+					: markAuthFailure(provider, errorText);
+				await switchToFallback(ctx, failedModel,
+					`external provider authentication failed: ${errorText.slice(0, 100)}`, killed ? 0 : config.transientCooldownMs,
+					{ scope: "provider" });
+				return;
+			}
 			const accountLevel = failureKind === "auth" || (failureKind === "limit" && !/^google-antigravity(?:-account-\d+)?$/.test(provider));
 			if (accountLevel || failureKind === "model" || failureKind === "limit") {
 				await switchToFallback(
 					ctx,
 					failedModel,
-					`external provider out of quota: ${errorText.slice(0, 100)}`,
+					`external provider ${failureKind === "auth" ? "authentication failed" : failureKind === "model" ? "model unavailable" : "out of quota"}: ${errorText.slice(0, 100)}`,
 					accountLevel ? config.cooldownMs : config.transientCooldownMs,
 					{
 						scope: accountLevel ? "provider" : "model",
@@ -13854,6 +13926,19 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 			register(id); highest = Math.max(highest, Number(id.slice(id.lastIndexOf("-") + 1)));
 		}
 		if (highest && highest < config.maxAccountsPerProvider) register(`${base}-account-${highest + 1}`);
+		for (const [id] of registered) {
+			const entry = auth[id] as any;
+			if (entry?.catalog && Array.isArray(entry.catalog) && entry.catalog.length > 0) {
+				const snapshot = parseAntigravityUsageBody(
+					id,
+					entry.catalog,
+					entry.catalogAt ?? Date.now(),
+					credentialHash(entry),
+					entry.accountId,
+				);
+				if (snapshot) usageByProvider.set(id, snapshot);
+			}
+		}
 		pi.registerCommand("antigravity", {
 			description: "Account-discovered models and individual model quotas; /antigravity refresh fetches current evidence",
 			handler: async (args, ctx) => {
@@ -13861,6 +13946,21 @@ export default function piMultiAccount(pi: ExtensionAPI, options: MultiAccountOp
 				if (args.trim() === "refresh") {
 					const result = await ctx.modelRegistry.refresh({ providers: [...registered.keys()], allowNetwork: true, force: true });
 					if (result.errors.size) ctx.ui.notify(`Antigravity refresh failed for: ${[...result.errors.keys()].join(", ")}; retained data may be stale`, "warning");
+					for (const [id, prov] of registered) {
+						const snapshot = prov.quotaSnapshot();
+						if (snapshot.models.length > 0) {
+							const entry = readAuthFile()[id] as any;
+							const parsed = parseAntigravityUsageBody(
+								id,
+								snapshot.models,
+								snapshot.updatedAt ?? Date.now(),
+								entry ? credentialHash(entry) : undefined,
+								entry?.accountId,
+							);
+							if (parsed) storeUsage(ctx, parsed);
+						}
+					}
+					updateUsageStatus(ctx);
 				}
 				const lines = ["Antigravity — per-model observations, not inferred shared quota pools:"];
 				for (const [id, provider] of registered) {

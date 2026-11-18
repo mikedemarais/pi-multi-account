@@ -15,6 +15,7 @@ import { createGoogleReplayCache } from "../google-transport/replay.ts";
 import { events } from "../google-transport/sse.ts";
 import { operationSignal, record, cancellable } from "../google-transport/http.ts";
 import * as ag from "./transport.ts";
+import { antigravityParameters } from "./schema.ts";
 
 /** Callers must supply reviewed model metadata; no fabricated entitlement/catalog. */
 export function createAntigravityStream(models: readonly Model<Api>[], options: {
@@ -43,7 +44,7 @@ export function createAntigravityStream(models: readonly Model<Api>[], options: 
     signal = operationSignal(signal, request.timeoutMs ?? 120000);
     signal.throwIfAborted(); options.assertConfiguration?.();
     const { convertMessages, convertTools, resolveGoogleThinkingLevel, usesGoogleThinkingLevel,
-     toGoogleThinkingLevel, getDisabledGoogleThinkingConfig, retainThoughtSignature } = await loadGoogleHelpers();
+     toGoogleThinkingLevel, getDisabledGoogleThinkingConfig, retainThoughtSignature, supportsGoogleStrictToolSampling } = await loadGoogleHelpers();
     signal.throwIfAborted();
     if (model.provider !== id || model.api !== api || model.baseUrl !== baseUrl)
      throw new Error("Google subscription requires its exact route");
@@ -78,9 +79,13 @@ export function createAntigravityStream(models: readonly Model<Api>[], options: 
      generationConfig.thinkingConfig = { include_thoughts:true, thinking_budget:budget };
      authHeaders.set("anthropic-beta", "interleaved-thinking-2025-05-14");
     }
+    const isClaude = nativeModel.id.startsWith("claude-");
+    const supportsStrict = typeof supportsGoogleStrictToolSampling === "function"
+     ? supportsGoogleStrictToolSampling(nativeModel.id)
+     : !isClaude && !nativeModel.id.startsWith("gpt-oss-");
     const payload = { contents: convertMessages(nativeModel, normalized),
      systemInstruction: { parts: [{ text: getCurrentSystemPrompt(normalized.messages) }] },
-     tools: convertTools(tools, true), generationConfig,
+     tools: convertTools(tools.map(tool => ({ ...tool, parameters: antigravityParameters(tool.parameters, isClaude) as typeof tool.parameters })), true, supportsStrict), generationConfig,
      ...(request.toolChoice ? { toolConfig: { functionCallingConfig: { mode: request.toolChoice === "none" ? "NONE" : "AUTO" } } } : {}) };
     const replacement = await cancellable(Promise.resolve(request.onPayload?.(payload, model)), signal);
     options.assertConfiguration?.(); signal.throwIfAborted();
@@ -93,7 +98,7 @@ export function createAntigravityStream(models: readonly Model<Api>[], options: 
     const response = await ag.request(options.fetch ?? fetch, ag.STREAM, { project:projectId, model:model.id, request:content,
        requestType:"agent", userAgent:"antigravity", requestId:`agent-${randomUUID()}`, enabled_credit_types:[] }, signal, authHeaders);
     await cancellable(Promise.resolve(request.onResponse?.({ status: response.status, headers: Object.fromEntries(response.headers) }, model)), signal);
-    if (!response.ok) { await response.body?.cancel(); throw new Error(`Antigravity HTTP ${response.status}`); }
+    if (!response.ok) throw await ag.responseError(response, signal);
     if (!response.body) throw new Error("Missing Google stream body");
     stream.push({ type: "start", partial: message });
     let terminal: string | undefined;
